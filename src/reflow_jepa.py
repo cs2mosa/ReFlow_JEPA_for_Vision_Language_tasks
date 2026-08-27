@@ -110,7 +110,6 @@ class ReflowJEPA(nn.Module):
     def encode_text_online(self, captions) -> torch.Tensor:
         batch = self.tokenizer(captions)
         batch = {k: v.to(images.device) for k, v in batch.items()}   # <-- add this line
-        
         out = self.text_seq2seq.get_encoder()(**batch).last_hidden_state
         pooled = _mean_pool_text(out, batch["attention_mask"])
         return self.g_t_online(pooled)  # z_t_tilde = Z_1, (B, d_shared)
@@ -122,6 +121,7 @@ class ReflowJEPA(nn.Module):
         routes Z_1 through the ONLINE text pipeline; the target copy tracks it via EMA
         for stability, mirroring I-JEPA/BYOL/DINO precedent)."""
         batch = self.tokenizer(captions)
+        batch = {k: v.to(images.device) for k, v in batch.items()}   # <-- add this line
         out = self.text_encoder_target(**batch).last_hidden_state
         pooled = _mean_pool_text(out, batch["attention_mask"])
         return self.g_t_target(pooled)
@@ -157,6 +157,7 @@ class ReflowJEPA(nn.Module):
         z_v_tilde = self.encode_visual(images, c)          # (B, d)
 
         batch = self.tokenizer(captions)
+        batch = {k: v.to(images.device) for k, v in batch.items()}   # <-- add this line
         enc_out = self.text_seq2seq.get_encoder()(**batch).last_hidden_state
         pooled = _mean_pool_text(enc_out, batch["attention_mask"])
         z_t_tilde = self.g_t_online(pooled)                 # (B, d) = Z_1
