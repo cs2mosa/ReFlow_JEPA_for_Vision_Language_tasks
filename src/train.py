@@ -80,7 +80,8 @@ def evaluate_manifold_adherence(model, images, captions, n_steps=30, eps_quantil
     pairwise target-embedding distances (so it's meaningful regardless of the current
     embedding scale, which drifts over training)."""
     z_hat = model.integrate(images, n_steps=n_steps)
-    batch = model.tokenizer(captions)
+    batch = self.tokenizer(captions)
+    batch = {k: v.to(images.device) for k, v in batch.items()}   # <-- add this line
     enc_out = model.text_seq2seq.get_encoder()(**batch).last_hidden_state
     from reflow_jepa import _mean_pool_text
     pooled = _mean_pool_text(enc_out, batch["attention_mask"])
