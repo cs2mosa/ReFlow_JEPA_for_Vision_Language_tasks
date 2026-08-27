@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.pt
+*.pth
+training_log.json
+*.egg-info/
+.ipynb_checkpoints/
