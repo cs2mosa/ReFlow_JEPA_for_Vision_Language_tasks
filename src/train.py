@@ -72,24 +72,32 @@ def build_model(args, device):
 
 
 @torch.no_grad()
-def evaluate_manifold_adherence(model, images, captions, n_steps=30, eps_quantile=0.5):
+def evaluate_manifold_adherence(model, images, captions, n_steps=30, eps_frac=0.15):
     """Empirical counterpart to Theorem 2's manifold-adherence claim (DESIGN.md's own
     Conclusion, item 1, explicitly flags this as NOT guaranteed to survive finite
     capacity/training -- this metric is exactly how you'd notice if it doesn't).
-    Pr[dist(z_hat_t, M_T) <= eps], eps set adaptively as a quantile of the batch's own
-    pairwise target-embedding distances (so it's meaningful regardless of the current
-    embedding scale, which drifts over training)."""
+    Pr[dist(z_hat_t, M_T) <= eps].
+
+    eps is set as a FIXED fraction of the batch's mean target embedding norm, not as a
+    quantile of pairwise target-target distances. An earlier version used the latter and
+    is worth naming as a real bug found in practice: when the text embeddings collapse
+    (vicreg_t stuck near its penalty maximum, as happened in a real training run), the
+    pairwise-distance-based eps collapses right along with them, making the metric
+    self-referentially unreadable -- it can't distinguish "the flow is failing" from
+    "the targets aren't diverse enough to calibrate a meaningful eps against" using data
+    from the same collapsed batch. Anchoring eps to embedding norm instead keeps the bar
+    fixed regardless of how spread out (or not) the targets currently are.
+    """
     z_hat = model.integrate(images, n_steps=n_steps)
     batch = model.tokenizer(captions)
-    batch = {k: v.to(images.device) for k, v in batch.items()}   # <-- add this line
+    batch = {k: v.to(images.device) for k, v in batch.items()} 
     enc_out = model.text_seq2seq.get_encoder()(**batch).last_hidden_state
     from reflow_jepa import _mean_pool_text
     pooled = _mean_pool_text(enc_out, batch["attention_mask"])
     z_true = model.g_t_online(pooled)
 
     dist_to_own_target = (z_hat - z_true).norm(dim=-1)
-    pairwise = torch.cdist(z_true, z_true)
-    eps = pairwise[pairwise > 0].quantile(eps_quantile).item() if (pairwise > 0).any() else 1.0
+    eps = eps_frac * z_true.norm(dim=-1).mean().item()
     adherence_rate = (dist_to_own_target <= eps).float().mean().item()
     return {
         "manifold_adherence_rate": adherence_rate,
