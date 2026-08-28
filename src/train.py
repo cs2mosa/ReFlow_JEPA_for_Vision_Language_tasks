@@ -33,6 +33,15 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--sigma", type=float, default=0.3, help="stochastic source noise scale")
+    p.add_argument("--vicreg-warmup-steps", type=int, default=0,
+                    help="if >0, vicreg_v/vicreg_t weights are multiplied by "
+                         "--vicreg-warmup-mult for this many steps, then linearly "
+                         "decayed to their base value. Standard collapse-avoidance "
+                         "pattern (VICReg/BYOL/DINO): let anti-collapse pressure "
+                         "dominate before cfm_loss's regression pressure (which grows "
+                         "once representations stop collapsing, per an observed real "
+                         "run) has a chance to compete on comparable footing.")
+    p.add_argument("--vicreg-warmup-mult", type=float, default=8.0)
     p.add_argument("--vicreg-v-weight", type=float, default=None,
                     help="overrides --vicreg-weight for the visual term only, if set")
     p.add_argument("--vicreg-t-weight", type=float, default=None,
@@ -165,6 +174,11 @@ def main():
         cfm_loss, recon_loss, vicreg_v_loss, vicreg_t_loss, diag = model.training_step(images, captions)
         vicreg_v_weight = args.vicreg_v_weight if args.vicreg_v_weight is not None else args.vicreg_weight
         vicreg_t_weight = args.vicreg_t_weight if args.vicreg_t_weight is not None else args.vicreg_weight
+        if args.vicreg_warmup_steps > 0 and step < args.vicreg_warmup_steps:
+            warmup_frac = 1.0 - step / args.vicreg_warmup_steps  # 1 -> 0 over warmup
+            mult = 1.0 + (args.vicreg_warmup_mult - 1.0) * warmup_frac
+            vicreg_v_weight *= mult
+            vicreg_t_weight *= mult
         total_loss = (cfm_loss + args.recon_weight * recon_loss
                       + vicreg_v_weight * vicreg_v_loss + vicreg_t_weight * vicreg_t_loss)
 
@@ -192,9 +206,12 @@ def main():
             diag["grad_norm_breakdown"] = grad_norms
             print(f"           [eval] adherence_rate={eval_diag['manifold_adherence_rate']:.3f} "
                   f"mean_dist={eval_diag['mean_dist_to_true_target']:.4f}")
-            print(f"           [grad] on g_t_online output layer: cfm={grad_norms['cfm']:.4f} "
-                  f"recon={grad_norms['recon']:.4f} vicreg_t={grad_norms['vicreg_t']:.4f} "
-                  f"(vicreg_t weighted: {grad_norms['vicreg_t'] * vicreg_t_weight:.4f})")
+            print(f"           [grad-text] cfm={grad_norms['cfm_on_text']:.4f} "
+                  f"recon={grad_norms['recon_on_text']:.4f} vicreg_t={grad_norms['vicreg_t_on_text']:.4f} "
+                  f"(weighted: {grad_norms['vicreg_t_on_text'] * vicreg_t_weight:.4f})")
+            print(f"           [grad-visual] cfm={grad_norms['cfm_on_visual']:.4f} "
+                  f"vicreg_v={grad_norms['vicreg_v_on_visual']:.4f} "
+                  f"(weighted: {grad_norms['vicreg_v_on_visual'] * vicreg_v_weight:.4f})")
 
         log.append(diag)
         step += 1

@@ -217,7 +217,28 @@ class ReflowJEPA(nn.Module):
         B = images.shape[0]
         c = self.task_token.expand(B, -1)
 
-        z_v_tilde = self.encode_visual(images, c)          # (B, d)
+        z_v_tilde = self.encode_visual(images, c)          # (B, d) -- NOT detached: still
+                                                             # used as the predictor's
+                                                             # conditioning input below,
+                                                             # which is the only real
+                                                             # task-relevant signal Q-Pool
+                                                             # has (nothing else touches it)
+
+        # Stop-gradient z_v_tilde ONLY for its role defining the stochastic source Z_0.
+        # Rationale, found empirically: after detaching Z_1 for cfm_loss (see above), a
+        # real run showed vicreg_v stuck at ~0.97-0.98 for 300+ steps, unmoved -- ALL of
+        # cfm_loss's gradient pressure that previously split across both z_v_tilde and
+        # z_t_tilde now concentrates entirely on z_v_tilde, since detaching Z_1 removed
+        # its other outlet. And there's a specific mechanical reason cfm_loss doesn't
+        # need real visual information to be minimized here: with Z_0 = z_v_tilde +
+        # sigma*eps, eps is "exactly invertible from Z_tau, so zero CFM loss is
+        # achievable despite total collapse" (DESIGN.md's own warning about this exact
+        # mechanism) -- the predictor can satisfy the regression using only the noise
+        # term, giving z_v_tilde no real incentive to stay informative via THIS pathway.
+        # Detaching it here removes that free-riding route while preserving the
+        # conditioning-input gradient path (below), which DOES require z_v_tilde to
+        # carry real information for the predictor to use it well.
+        z_v_for_source = z_v_tilde.detach() if self.stop_grad_cfm_target else z_v_tilde
 
         batch = self.tokenizer(captions)
         batch = {k: v.to(images.device) for k, v in batch.items()} 
@@ -237,11 +258,11 @@ class ReflowJEPA(nn.Module):
         # is, without being able to drag it around to make its own regression easier.
         Z1_for_cfm = z_t_tilde.detach() if self.stop_grad_cfm_target else z_t_tilde
 
-        Z0 = draw_stochastic_source(z_v_tilde, self.sigma)
+        Z0 = draw_stochastic_source(z_v_for_source, self.sigma)
         tau = torch.rand(B, device=images.device)
         Z_tau = (1 - tau).unsqueeze(-1) * Z0 + tau.unsqueeze(-1) * Z1_for_cfm
 
-        v_pred = self.predictor(Z_tau, tau, z_v_tilde, c)
+        v_pred = self.predictor(Z_tau, tau, z_v_tilde, c)   # conditioning: full gradient, NOT z_v_for_source
         cfm_loss = (v_pred - (Z1_for_cfm - Z0)).pow(2).sum(dim=-1).mean()
 
         Z1 = z_t_tilde  # non-detached: recon_loss and vicreg_t below DO shape g_T
@@ -263,24 +284,29 @@ class ReflowJEPA(nn.Module):
         return cfm_loss, recon_loss, vicreg_v, vicreg_t, diagnostics
 
     def gradient_norm_breakdown(self, images: torch.Tensor, captions, vicreg_gamma: float = 1.0):
-        """Diagnostic only (not part of the training step): computes, for each loss
-        term separately, the gradient norm it induces on g_t_online's output layer --
-        the shared parameter all four terms (cfm, recon, vicreg_v indirectly via
-        z_v_tilde's own path, vicreg_t) can influence. Directly answers "is VICReg
-        actually competing on equal footing with cfm/recon, or is it the only term
-        providing any pressure at all" instead of inferring it from loss curves alone.
-        Expensive (multiple backward passes) -- call sparingly, e.g. at eval_every."""
+        """Diagnostic only (not part of the training step): for each loss term, the
+        gradient norm it induces on TWO shared anchors -- g_t_online's output layer
+        (text side) and qpool.g_v's output layer (visual side). Directly answers "is
+        VICReg actually competing on equal footing, or is cfm_loss's remaining
+        pressure concentrating somewhere unopposed" instead of inferring it from loss
+        curves alone. This is exactly how the visual-side collapse (after fixing the
+        text side) was found: detaching Z_1 removed cfm_loss's outlet through the text
+        branch, concentrating all of it onto z_v_tilde instead. Expensive (multiple
+        backward passes) -- call sparingly, e.g. at eval_every."""
         B = images.shape[0]
         c = self.task_token.expand(B, -1)
         z_v_tilde = self.encode_visual(images, c)
+        z_v_for_source = z_v_tilde.detach() if self.stop_grad_cfm_target else z_v_tilde
         batch = self.tokenizer(captions)
         batch = {k: v.to(images.device) for k, v in batch.items()} 
         enc_out = self.text_seq2seq.get_encoder()(**batch).last_hidden_state
         pooled = _mean_pool_text(enc_out, batch["attention_mask"])
         z_t_tilde = self.g_t_online(pooled)
 
-        anchor = self.g_t_online.net[-1].weight
-        Z0 = draw_stochastic_source(z_v_tilde, self.sigma)
+        text_anchor = self.g_t_online.net[-1].weight
+        visual_anchor = self.qpool.g_v[-1].weight
+
+        Z0 = draw_stochastic_source(z_v_for_source, self.sigma)
         Z1_for_cfm = z_t_tilde.detach() if self.stop_grad_cfm_target else z_t_tilde
         Z1 = z_t_tilde
         tau = torch.rand(B, device=images.device)
@@ -290,9 +316,14 @@ class ReflowJEPA(nn.Module):
         recon_prefix = self.prefix_expand(Z1)
         recon_loss = self.text_seq2seq(encoder_outputs=(recon_prefix,), labels=batch["input_ids"]).loss
         vicreg_t = vicreg_variance_penalty(Z1, gamma_0=vicreg_gamma)
+        vicreg_v = vicreg_variance_penalty(z_v_tilde, gamma_0=vicreg_gamma)
 
         norms = {}
-        for name, loss in [("cfm", cfm_loss), ("recon", recon_loss), ("vicreg_t", vicreg_t)]:
+        for name, loss, anchor in [
+            ("cfm_on_text", cfm_loss, text_anchor), ("recon_on_text", recon_loss, text_anchor),
+            ("vicreg_t_on_text", vicreg_t, text_anchor),
+            ("cfm_on_visual", cfm_loss, visual_anchor), ("vicreg_v_on_visual", vicreg_v, visual_anchor),
+        ]:
             grad = torch.autograd.grad(loss, anchor, retain_graph=True, allow_unused=True)[0]
             norms[name] = 0.0 if grad is None else grad.norm().item()
         return norms
