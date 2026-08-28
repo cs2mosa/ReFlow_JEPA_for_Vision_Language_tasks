@@ -344,6 +344,8 @@ class ReflowJEPA(nn.Module):
             tau_batch = taus[i].expand(B)
             v = self.predictor(Z, tau_batch, z_v_tilde, c)
             Z = Z + v * dtau
+            if i % 10 == 0:
+                print(f"    [integrate] step {i}: ||Z|| mean={Z.norm(dim=-1).mean().item():.2f}")
         return Z  # z_hat_t
 
     @torch.no_grad()
