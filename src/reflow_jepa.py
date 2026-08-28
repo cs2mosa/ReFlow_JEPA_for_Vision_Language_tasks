@@ -11,9 +11,21 @@ General-VL pretraining phase specifics (per project decisions):
   - Decoding is Pipeline 2 (OFM-JEPA v2 §4): Prefix-Expand -> the SAME T5 checkpoint's
     own decoder (exposure-bias consistency), not a candidate-bank snap. The bank-snap
     decoder (Pipeline 1) is deferred to the VQA extension.
+  - z_v_tilde and z_t_tilde are L2-normalized to the unit sphere (DESIGN.md item 13:
+    "L2-normalize both embeddings before flow matching... standard practice, quantified
+    per-encoder in test_03" -- test_03 validated the mechanism but this was never wired
+    into the trained model itself until now). This changes the natural embedding scale
+    from whatever an unnormalized projection head happens to produce down to exactly
+    1.0, which is why `sigma` (stochastic source noise) and `vicreg_gamma` (VICReg's
+    target std) both needed recalibrating downward in the same change -- see their
+    docstrings/CLI help for the arithmetic. Shipping L2-norm without this would have
+    made noise ~8x larger than signal and made VICReg's target permanently
+    unsatisfiable (max possible per-dim std on a 768-dim unit sphere is ~0.036, far
+    below the old default of 1.0).
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from encoders import (
     D_SHARED, D_IJEPA, D_TEXT, P_PATCHES, K_QUERY_SLOTS, K_PREFIX_TOKENS,
@@ -56,7 +68,7 @@ class ReflowJEPA(nn.Module):
         predictor_heads: int = 8,
         visual_layers: int = 2,
         text_layers: int = 2,
-        sigma: float = 0.3,
+        sigma: float = 0.02,
         ema_momentum: float = 0.996,
         real_checkpoints: bool = False,
         freeze_text_encoder: bool = True,
@@ -113,6 +125,29 @@ class ReflowJEPA(nn.Module):
         # Single learned task-token, general-VL captioning phase (no per-example question)
         self.task_token = nn.Parameter(torch.randn(1, d_text) * 0.02)
 
+    def _tokenize(self, captions):
+        """Single place tokenizer output gets moved to the model's device. Fixes a
+        real bug found in practice: the mock (and real HF) tokenizer always returns
+        CPU tensors regardless of model device, causing a device-mismatch crash on any
+        GPU run. Previously patched ad hoc after each of 4 separate call sites -- this
+        consolidates it into one place so a 5th call site can't silently miss it."""
+        batch = self.tokenizer(captions)
+        device = self.task_token.device
+        return {k: v.to(device) for k, v in batch.items()}
+
+    def _project_text(self, batch, encoder, proj) -> torch.Tensor:
+        """Shared text-encode-and-project logic, used for BOTH the online and target
+        (EMA) pipelines by passing in whichever encoder/proj pair. L2-normalizes the
+        output -- DESIGN.md item 13 requires this explicitly ("L2-normalize both
+        embeddings before flow matching... quantified per-encoder in test_03") and
+        test_03's test_l2_normalization_fixes_scale already validates the mechanism;
+        this was the missing wiring step that never actually called it in the trained
+        model, despite the test passing."""
+        out = encoder(**batch).last_hidden_state
+        pooled = _mean_pool_text(out, batch["attention_mask"])
+        z = proj(pooled)
+        return F.normalize(z, dim=-1)
+
     def trainable_parameters(self):
         """Everything with requires_grad=True. nn.Module.parameters() already
         deduplicates shared submodules (e.g. T5's shared input embedding, referenced
@@ -166,14 +201,12 @@ class ReflowJEPA(nn.Module):
 
     def encode_visual(self, images: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         h_v = self._visual_forward(images)
-        return self.qpool(h_v, c)  # z_v_tilde, (B, d_shared)
+        z_v = self.qpool(h_v, c)
+        return F.normalize(z_v, dim=-1)  # z_v_tilde, (B, d_shared), unit norm -- see _project_text's docstring
 
     def encode_text_online(self, captions) -> torch.Tensor:
-        batch = self.tokenizer(captions)
-        batch = {k: v.to(images.device) for k, v in batch.items()} 
-        out = self.text_seq2seq.get_encoder()(**batch).last_hidden_state
-        pooled = _mean_pool_text(out, batch["attention_mask"])
-        return self.g_t_online(pooled)  # z_t_tilde = Z_1, (B, d_shared)
+        batch = self._tokenize(captions)
+        return self._project_text(batch, self.text_seq2seq.get_encoder(), self.g_t_online)
 
     @torch.no_grad()
     def encode_text_target(self, captions) -> torch.Tensor:
@@ -181,11 +214,8 @@ class ReflowJEPA(nn.Module):
         metrics) -- NOT part of the CFM training loss itself (DESIGN.md's data flow
         routes Z_1 through the ONLINE text pipeline; the target copy tracks it via EMA
         for stability, mirroring I-JEPA/BYOL/DINO precedent)."""
-        batch = self.tokenizer(captions)
-        batch = {k: v.to(images.device) for k, v in batch.items()} 
-        out = self.text_encoder_target(**batch).last_hidden_state
-        pooled = _mean_pool_text(out, batch["attention_mask"])
-        return self.g_t_target(pooled)
+        batch = self._tokenize(captions)
+        return self._project_text(batch, self.text_encoder_target, self.g_t_target)
 
     @torch.no_grad()
     def update_ema_target(self) -> None:
@@ -194,7 +224,7 @@ class ReflowJEPA(nn.Module):
         # if frozen, text_encoder_target IS the online encoder (same object) -- nothing to update
         ema_update(self.g_t_target, self.g_t_online, self.ema_momentum)
 
-    def training_step(self, images: torch.Tensor, captions, vicreg_gamma: float = 1.0):
+    def training_step(self, images: torch.Tensor, captions, vicreg_gamma: float = 0.02):
         """Phase 1 base CFM (DESIGN.md §2.4, Algorithm 1 line 4), PLUS a decoder
         reconstruction loss that DESIGN.md's original (VQA/candidate-bank) design never
         needed but Pipeline 2 does.
@@ -240,11 +270,8 @@ class ReflowJEPA(nn.Module):
         # carry real information for the predictor to use it well.
         z_v_for_source = z_v_tilde.detach() if self.stop_grad_cfm_target else z_v_tilde
 
-        batch = self.tokenizer(captions)
-        batch = {k: v.to(images.device) for k, v in batch.items()} 
-        enc_out = self.text_seq2seq.get_encoder()(**batch).last_hidden_state
-        pooled = _mean_pool_text(enc_out, batch["attention_mask"])
-        z_t_tilde = self.g_t_online(pooled)                 # (B, d) = Z_1
+        batch = self._tokenize(captions)
+        z_t_tilde = self._project_text(batch, self.text_seq2seq.get_encoder(), self.g_t_online)  # Z_1, unit norm
 
         # STOP-GRADIENT for the CFM regression target only (mirrors latent-diffusion
         # practice: freeze the VAE/representation, train the prior only in its latent
@@ -283,7 +310,7 @@ class ReflowJEPA(nn.Module):
         }
         return cfm_loss, recon_loss, vicreg_v, vicreg_t, diagnostics
 
-    def gradient_norm_breakdown(self, images: torch.Tensor, captions, vicreg_gamma: float = 1.0):
+    def gradient_norm_breakdown(self, images: torch.Tensor, captions, vicreg_gamma: float = 0.02):
         """Diagnostic only (not part of the training step): for each loss term, the
         gradient norm it induces on TWO shared anchors -- g_t_online's output layer
         (text side) and qpool.g_v's output layer (visual side). Directly answers "is
@@ -297,11 +324,8 @@ class ReflowJEPA(nn.Module):
         c = self.task_token.expand(B, -1)
         z_v_tilde = self.encode_visual(images, c)
         z_v_for_source = z_v_tilde.detach() if self.stop_grad_cfm_target else z_v_tilde
-        batch = self.tokenizer(captions)
-        batch = {k: v.to(images.device) for k, v in batch.items()} 
-        enc_out = self.text_seq2seq.get_encoder()(**batch).last_hidden_state
-        pooled = _mean_pool_text(enc_out, batch["attention_mask"])
-        z_t_tilde = self.g_t_online(pooled)
+        batch = self._tokenize(captions)
+        z_t_tilde = self._project_text(batch, self.text_seq2seq.get_encoder(), self.g_t_online)
 
         text_anchor = self.g_t_online.net[-1].weight
         visual_anchor = self.qpool.g_v[-1].weight
@@ -344,8 +368,6 @@ class ReflowJEPA(nn.Module):
             tau_batch = taus[i].expand(B)
             v = self.predictor(Z, tau_batch, z_v_tilde, c)
             Z = Z + v * dtau
-            if i % 10 == 0:
-                print(f"    [integrate] step {i}: ||Z|| mean={Z.norm(dim=-1).mean().item():.2f}")
         return Z  # z_hat_t
 
     @torch.no_grad()

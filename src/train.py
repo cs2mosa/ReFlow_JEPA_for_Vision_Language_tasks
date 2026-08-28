@@ -21,6 +21,7 @@ import os
 import time
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from reflow_jepa import ReflowJEPA
@@ -32,7 +33,19 @@ def parse_args():
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--sigma", type=float, default=0.3, help="stochastic source noise scale")
+    p.add_argument("--sigma", type=float, default=0.02,
+                    help="stochastic source noise scale. Recalibrated for L2-normalized "
+                         "(unit-sphere) embeddings: at sigma=0.02, E[||sigma*eps||]~0.55 "
+                         "vs signal norm 1.0. The old default (0.3) was tuned before "
+                         "L2-norm was wired in and would now make noise ~8x larger than "
+                         "signal.")
+    p.add_argument("--vicreg-gamma", type=float, default=0.02,
+                    help="VICReg target per-dimension std (gamma_0). Recalibrated for "
+                         "unit-sphere embeddings: max possible per-dim std for "
+                         "isotropically-spread 768-dim unit vectors is 1/sqrt(768)~0.036; "
+                         "0.02 targets ~55%% of that, leaving some slack. The old default "
+                         "(1.0) is unreachable on a unit sphere and would make VICReg "
+                         "look permanently collapsed regardless of actual embedding health.")
     p.add_argument("--vicreg-warmup-steps", type=int, default=0,
                     help="if >0, vicreg_v/vicreg_t weights are multiplied by "
                          "--vicreg-warmup-mult for this many steps, then linearly "
@@ -121,11 +134,15 @@ def evaluate_manifold_adherence(model, images, captions, n_steps=30, eps_frac=0.
     """
     z_hat = model.integrate(images, n_steps=n_steps)
     batch = model.tokenizer(captions)
-    batch = {k: v.to(images.device) for k, v in batch.items()} 
+    batch = {k: v.to(images.device) for k, v in batch.items()}  # tokenizer always returns
+                                                                  # CPU tensors -- see
+                                                                  # ReflowJEPA._tokenize's
+                                                                  # docstring for why this
+                                                                  # is needed at every call site
     enc_out = model.text_seq2seq.get_encoder()(**batch).last_hidden_state
     from reflow_jepa import _mean_pool_text
     pooled = _mean_pool_text(enc_out, batch["attention_mask"])
-    z_true = model.g_t_online(pooled)
+    z_true = F.normalize(model.g_t_online(pooled), dim=-1)  # match training: L2-normalized
 
     dist_to_own_target = (z_hat - z_true).norm(dim=-1)
     eps = eps_frac * z_true.norm(dim=-1).mean().item()
@@ -171,7 +188,8 @@ def main():
             images, captions = next(data_iter)
         images = images.to(device)
 
-        cfm_loss, recon_loss, vicreg_v_loss, vicreg_t_loss, diag = model.training_step(images, captions)
+        cfm_loss, recon_loss, vicreg_v_loss, vicreg_t_loss, diag = model.training_step(
+            images, captions, vicreg_gamma=args.vicreg_gamma)
         vicreg_v_weight = args.vicreg_v_weight if args.vicreg_v_weight is not None else args.vicreg_weight
         vicreg_t_weight = args.vicreg_t_weight if args.vicreg_t_weight is not None else args.vicreg_weight
         if args.vicreg_warmup_steps > 0 and step < args.vicreg_warmup_steps:
@@ -202,7 +220,7 @@ def main():
             eval_images = eval_images.to(device)
             eval_diag = evaluate_manifold_adherence(model, eval_images, eval_captions)
             diag.update({f"eval_{k}": v for k, v in eval_diag.items()})
-            grad_norms = model.gradient_norm_breakdown(images, captions)
+            grad_norms = model.gradient_norm_breakdown(images, captions, vicreg_gamma=args.vicreg_gamma)
             diag["grad_norm_breakdown"] = grad_norms
             print(f"           [eval] adherence_rate={eval_diag['manifold_adherence_rate']:.3f} "
                   f"mean_dist={eval_diag['mean_dist_to_true_target']:.4f}")
