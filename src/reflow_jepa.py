@@ -59,10 +59,14 @@ class ReflowJEPA(nn.Module):
         sigma: float = 0.3,
         ema_momentum: float = 0.996,
         real_checkpoints: bool = False,
+        freeze_text_encoder: bool = True,
+        stop_grad_cfm_target: bool = True,
     ):
         super().__init__()
         self.sigma = sigma
         self.ema_momentum = ema_momentum
+        self.freeze_text_encoder = freeze_text_encoder
+        self.stop_grad_cfm_target = stop_grad_cfm_target
 
         # Frozen visual encoder E_V
         self.visual_encoder = load_visual_encoder(num_layers=visual_layers, real_checkpoint=real_checkpoints)
@@ -72,11 +76,32 @@ class ReflowJEPA(nn.Module):
         # Trainable Q-Pool (fuses Q-Pool + g_V per the original test suite's implementation)
         self.qpool = QPool(d_v=d_v, d_text=d_text, d_shared=d_shared, k=k_query)
 
-        # Text seq2seq: online encoder+decoder (trainable), same-modality EMA target
+        # Text seq2seq: online encoder+decoder, same-modality EMA target for the text
+        # projection. The ENCODER itself is frozen by default (freeze_text_encoder=True)
+        # -- see module-level rationale: an online encoder that's free to move can
+        # actively construct a collapsed solution to make the CFM objective trivially
+        # easy (DESIGN.md's own warning: "zero CFM loss is achievable despite total
+        # collapse... VICReg is a separate, independently necessary term" -- a real
+        # training run showed exactly this, vicreg_t pinned at ceiling for 1260+ steps
+        # even after removing the small-vocabulary confound). Freezing removes the
+        # encoder's ability to construct that collapse at all: whatever separation
+        # exists in its raw output (confirmed non-collapsed even at random weights,
+        # test_02b) is now fixed, and g_T alone has far less capacity to undo it than a
+        # full transformer encoder does. The DECODER is NOT frozen here -- with mock
+        # (never-pretrained) weights, freezing it at random init would leave zero
+        # gradient path to ever learn anything, which is a different failure mode from
+        # encoder-driven collapse. It's trained at a much smaller LR instead (see
+        # parameter_groups) -- this is the "very little LR" option applied only where
+        # a full freeze would actively break learning rather than fix collapse.
         self.text_seq2seq, self.tokenizer = load_text_seq2seq(num_layers=text_layers, real_checkpoint=real_checkpoints)
         self.g_t_online = TextProjectionHead(d_text=d_text, d_shared=d_shared)
 
-        self.text_encoder_target = make_ema_copy(self.text_seq2seq.get_encoder())
+        if freeze_text_encoder:
+            for p in self.text_seq2seq.get_encoder().parameters():
+                p.requires_grad_(False)
+            self.text_encoder_target = self.text_seq2seq.get_encoder()  # same object: online never moves
+        else:
+            self.text_encoder_target = make_ema_copy(self.text_seq2seq.get_encoder())
         self.g_t_target = make_ema_copy(self.g_t_online)
 
         # Predictor v_theta
@@ -89,14 +114,50 @@ class ReflowJEPA(nn.Module):
         self.task_token = nn.Parameter(torch.randn(1, d_text) * 0.02)
 
     def trainable_parameters(self):
-        """Everything except the frozen visual encoder and the EMA target copies
-        (which are updated by ema_update, not gradient descent)."""
-        modules = [self.qpool, self.text_seq2seq, self.g_t_online, self.predictor, self.prefix_expand]
-        for m in modules:
-            for p in m.parameters():
-                if p.requires_grad:
-                    yield p
-        yield self.task_token
+        """Everything with requires_grad=True. nn.Module.parameters() already
+        deduplicates shared submodules (e.g. T5's shared input embedding, referenced
+        from both .get_encoder() and .get_decoder()), so this is safe to use directly
+        for gradient clipping without double-counting."""
+        return (p for p in self.parameters() if p.requires_grad)
+
+    def parameter_groups(self, base_lr: float, decoder_lr_mult: float = 0.1):
+        """Per-component learning rates for the optimizer: qpool/g_T/predictor/
+        prefix_expand/task_token at base_lr; the text decoder (and, only if
+        freeze_text_encoder=False was chosen, the text encoder) at base_lr *
+        decoder_lr_mult -- the "very little LR" alternative to a hard freeze, used
+        here specifically for the decoder (see __init__'s rationale for why the
+        decoder can't be fully frozen with mock weights the way the encoder can).
+
+        Manually deduplicates by parameter id() across the decoder/encoder groups --
+        needed because HF's T5 shares one embedding table between encoder and decoder
+        (assigning it to two groups with different LRs would cause PyTorch to update it
+        twice per optimizer.step(), silently corrupting its Adam moment estimates)."""
+        core_params = [p for p in (
+            list(self.qpool.parameters()) + list(self.g_t_online.parameters())
+            + list(self.predictor.parameters()) + list(self.prefix_expand.parameters())
+            + [self.task_token]
+        ) if p.requires_grad]
+        seen = {id(p) for p in core_params}
+
+        decoder_params = []
+        for p in self.text_seq2seq.get_decoder().parameters():
+            if p.requires_grad and id(p) not in seen:
+                decoder_params.append(p)
+                seen.add(id(p))
+
+        encoder_params = []
+        if not self.freeze_text_encoder:
+            for p in self.text_seq2seq.get_encoder().parameters():
+                if p.requires_grad and id(p) not in seen:
+                    encoder_params.append(p)
+                    seen.add(id(p))
+
+        groups = [{"params": core_params, "lr": base_lr}]
+        if decoder_params:
+            groups.append({"params": decoder_params, "lr": base_lr * decoder_lr_mult})
+        if encoder_params:
+            groups.append({"params": encoder_params, "lr": base_lr * decoder_lr_mult})
+        return groups
 
     @torch.no_grad()
     def _visual_forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -128,7 +189,9 @@ class ReflowJEPA(nn.Module):
 
     @torch.no_grad()
     def update_ema_target(self) -> None:
-        ema_update(self.text_encoder_target, self.text_seq2seq.get_encoder(), self.ema_momentum)
+        if not self.freeze_text_encoder:
+            ema_update(self.text_encoder_target, self.text_seq2seq.get_encoder(), self.ema_momentum)
+        # if frozen, text_encoder_target IS the online encoder (same object) -- nothing to update
         ema_update(self.g_t_target, self.g_t_online, self.ema_momentum)
 
     def training_step(self, images: torch.Tensor, captions, vicreg_gamma: float = 1.0):
@@ -162,21 +225,32 @@ class ReflowJEPA(nn.Module):
         pooled = _mean_pool_text(enc_out, batch["attention_mask"])
         z_t_tilde = self.g_t_online(pooled)                 # (B, d) = Z_1
 
+        # STOP-GRADIENT for the CFM regression target only (mirrors latent-diffusion
+        # practice: freeze the VAE/representation, train the prior only in its latent
+        # space). Motivated directly by an empirical finding: a real training run's
+        # gradient-norm breakdown showed cfm_loss inducing a gradient of ~77 on
+        # g_t_online's output layer vs. vicreg_t's ~0.07 (even at 10x loss weight,
+        # ~0.7) -- cfm_loss was actively driving z_t BACK toward collapse over time,
+        # completely swamping VICReg's counter-pressure regardless of weight. Detaching
+        # Z1 here means only recon_loss and vicreg_t shape the text representation;
+        # cfm_loss trains the predictor to hit wherever that representation currently
+        # is, without being able to drag it around to make its own regression easier.
+        Z1_for_cfm = z_t_tilde.detach() if self.stop_grad_cfm_target else z_t_tilde
+
         Z0 = draw_stochastic_source(z_v_tilde, self.sigma)
-        Z1 = z_t_tilde
         tau = torch.rand(B, device=images.device)
-        Z_tau = (1 - tau).unsqueeze(-1) * Z0 + tau.unsqueeze(-1) * Z1
+        Z_tau = (1 - tau).unsqueeze(-1) * Z0 + tau.unsqueeze(-1) * Z1_for_cfm
 
         v_pred = self.predictor(Z_tau, tau, z_v_tilde, c)
-        cfm_loss = (v_pred - (Z1 - Z0)).pow(2).sum(dim=-1).mean()
+        cfm_loss = (v_pred - (Z1_for_cfm - Z0)).pow(2).sum(dim=-1).mean()
 
+        Z1 = z_t_tilde  # non-detached: recon_loss and vicreg_t below DO shape g_T
         recon_prefix = self.prefix_expand(Z1)
         recon_out = self.text_seq2seq(encoder_outputs=(recon_prefix,), labels=batch["input_ids"])
         recon_loss = recon_out.loss
 
         vicreg_v = vicreg_variance_penalty(z_v_tilde, gamma_0=vicreg_gamma)
         vicreg_t = vicreg_variance_penalty(Z1, gamma_0=vicreg_gamma)
-        vicreg_loss = vicreg_v + vicreg_t
 
         diagnostics = {
             "cfm_loss": cfm_loss.item(),
@@ -186,7 +260,41 @@ class ReflowJEPA(nn.Module):
             "z_v_norm": z_v_tilde.norm(dim=-1).mean().item(),
             "z_t_norm": Z1.norm(dim=-1).mean().item(),
         }
-        return cfm_loss, recon_loss, vicreg_loss, diagnostics
+        return cfm_loss, recon_loss, vicreg_v, vicreg_t, diagnostics
+
+    def gradient_norm_breakdown(self, images: torch.Tensor, captions, vicreg_gamma: float = 1.0):
+        """Diagnostic only (not part of the training step): computes, for each loss
+        term separately, the gradient norm it induces on g_t_online's output layer --
+        the shared parameter all four terms (cfm, recon, vicreg_v indirectly via
+        z_v_tilde's own path, vicreg_t) can influence. Directly answers "is VICReg
+        actually competing on equal footing with cfm/recon, or is it the only term
+        providing any pressure at all" instead of inferring it from loss curves alone.
+        Expensive (multiple backward passes) -- call sparingly, e.g. at eval_every."""
+        B = images.shape[0]
+        c = self.task_token.expand(B, -1)
+        z_v_tilde = self.encode_visual(images, c)
+        batch = self.tokenizer(captions)
+        enc_out = self.text_seq2seq.get_encoder()(**batch).last_hidden_state
+        pooled = _mean_pool_text(enc_out, batch["attention_mask"])
+        z_t_tilde = self.g_t_online(pooled)
+
+        anchor = self.g_t_online.net[-1].weight
+        Z0 = draw_stochastic_source(z_v_tilde, self.sigma)
+        Z1_for_cfm = z_t_tilde.detach() if self.stop_grad_cfm_target else z_t_tilde
+        Z1 = z_t_tilde
+        tau = torch.rand(B, device=images.device)
+        Z_tau = (1 - tau).unsqueeze(-1) * Z0 + tau.unsqueeze(-1) * Z1_for_cfm
+        v_pred = self.predictor(Z_tau, tau, z_v_tilde, c)
+        cfm_loss = (v_pred - (Z1_for_cfm - Z0)).pow(2).sum(dim=-1).mean()
+        recon_prefix = self.prefix_expand(Z1)
+        recon_loss = self.text_seq2seq(encoder_outputs=(recon_prefix,), labels=batch["input_ids"]).loss
+        vicreg_t = vicreg_variance_penalty(Z1, gamma_0=vicreg_gamma)
+
+        norms = {}
+        for name, loss in [("cfm", cfm_loss), ("recon", recon_loss), ("vicreg_t", vicreg_t)]:
+            grad = torch.autograd.grad(loss, anchor, retain_graph=True, allow_unused=True)[0]
+            norms[name] = 0.0 if grad is None else grad.norm().item()
+        return norms
 
     @torch.no_grad()
     def integrate(self, images: torch.Tensor, n_steps: int = 50, delta: float = 1e-3) -> torch.Tensor:

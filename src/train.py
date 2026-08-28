@@ -33,6 +33,10 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--sigma", type=float, default=0.3, help="stochastic source noise scale")
+    p.add_argument("--vicreg-v-weight", type=float, default=None,
+                    help="overrides --vicreg-weight for the visual term only, if set")
+    p.add_argument("--vicreg-t-weight", type=float, default=None,
+                    help="overrides --vicreg-weight for the text term only, if set")
     p.add_argument("--vicreg-weight", type=float, default=1.0)
     p.add_argument("--recon-weight", type=float, default=1.0)
     p.add_argument("--ema-momentum", type=float, default=0.996)
@@ -40,6 +44,22 @@ def parse_args():
     p.add_argument("--predictor-heads", type=int, default=8)
     p.add_argument("--visual-layers", type=int, default=2, help="ignored if --real-checkpoints")
     p.add_argument("--text-layers", type=int, default=2, help="ignored if --real-checkpoints")
+    p.add_argument("--freeze-text-encoder", type=lambda x: x.lower() != "false", default=True,
+                    help="freeze the T5 encoder entirely (recommended default -- see "
+                         "reflow_jepa.py's __init__ docstring for why). Pass "
+                         "--freeze-text-encoder false to keep it trainable at "
+                         "--decoder-lr-mult instead of a hard freeze.")
+    p.add_argument("--decoder-lr-mult", type=float, default=0.1,
+                    help="LR multiplier for the T5 decoder (and, if not frozen, the "
+                         "text encoder) relative to --lr. The decoder cannot be fully "
+                         "frozen with mock weights without breaking its ability to "
+                         "learn at all -- this is the 'very little LR' alternative.")
+    p.add_argument("--stop-grad-cfm-target", type=lambda x: x.lower() != "false", default=True,
+                    help="detach Z_1 before it enters the CFM regression loss (recommended "
+                         "default). See reflow_jepa.py's training_step docstring: a real "
+                         "run showed cfm_loss's gradient on the text projection (~77) "
+                         "completely swamping VICReg's counter-pressure (~0.07), actively "
+                         "driving collapse regardless of loss weight.")
     p.add_argument("--k-query", type=int, default=8)
     p.add_argument("--k-prefix", type=int, default=8)
     p.add_argument("--image-size", type=int, default=224)
@@ -67,6 +87,8 @@ def build_model(args, device):
         sigma=args.sigma,
         ema_momentum=args.ema_momentum,
         real_checkpoints=args.real_checkpoints,
+        freeze_text_encoder=args.freeze_text_encoder,
+        stop_grad_cfm_target=args.stop_grad_cfm_target,
     ).to(device)
     return model
 
@@ -126,7 +148,7 @@ def main():
         batch_size=args.batch_size, shuffle=True, collate_fn=collate_images_captions,
     )
 
-    optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameter_groups(args.lr, args.decoder_lr_mult))
 
     log = []
     step = 0
@@ -140,8 +162,11 @@ def main():
             images, captions = next(data_iter)
         images = images.to(device)
 
-        cfm_loss, recon_loss, vicreg_loss, diag = model.training_step(images, captions)
-        total_loss = cfm_loss + args.recon_weight * recon_loss + args.vicreg_weight * vicreg_loss
+        cfm_loss, recon_loss, vicreg_v_loss, vicreg_t_loss, diag = model.training_step(images, captions)
+        vicreg_v_weight = args.vicreg_v_weight if args.vicreg_v_weight is not None else args.vicreg_weight
+        vicreg_t_weight = args.vicreg_t_weight if args.vicreg_t_weight is not None else args.vicreg_weight
+        total_loss = (cfm_loss + args.recon_weight * recon_loss
+                      + vicreg_v_weight * vicreg_v_loss + vicreg_t_weight * vicreg_t_loss)
 
         optimizer.zero_grad()
         total_loss.backward()
@@ -163,8 +188,13 @@ def main():
             eval_images = eval_images.to(device)
             eval_diag = evaluate_manifold_adherence(model, eval_images, eval_captions)
             diag.update({f"eval_{k}": v for k, v in eval_diag.items()})
+            grad_norms = model.gradient_norm_breakdown(images, captions)
+            diag["grad_norm_breakdown"] = grad_norms
             print(f"           [eval] adherence_rate={eval_diag['manifold_adherence_rate']:.3f} "
                   f"mean_dist={eval_diag['mean_dist_to_true_target']:.4f}")
+            print(f"           [grad] on g_t_online output layer: cfm={grad_norms['cfm']:.4f} "
+                  f"recon={grad_norms['recon']:.4f} vicreg_t={grad_norms['vicreg_t']:.4f} "
+                  f"(vicreg_t weighted: {grad_norms['vicreg_t'] * vicreg_t_weight:.4f})")
 
         log.append(diag)
         step += 1

@@ -38,8 +38,8 @@ def test_recon_loss_mismatch_check_mechanics_run_cleanly():
     opt = torch.optim.Adam(model.trainable_parameters(), lr=1e-3)
     for _ in range(30):
         opt.zero_grad()
-        cfm_loss, recon_loss, vicreg_loss, _ = model.training_step(images, captions)
-        (cfm_loss + recon_loss + vicreg_loss).backward()
+        cfm_loss, recon_loss, vicreg_v, vicreg_t, _ = model.training_step(images, captions)
+        (cfm_loss + recon_loss + vicreg_v + vicreg_t).backward()
         opt.step()
 
     batch = model.tokenizer(captions)
