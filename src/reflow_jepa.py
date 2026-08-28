@@ -274,6 +274,7 @@ class ReflowJEPA(nn.Module):
         c = self.task_token.expand(B, -1)
         z_v_tilde = self.encode_visual(images, c)
         batch = self.tokenizer(captions)
+        batch = {k: v.to(images.device) for k, v in batch.items()} 
         enc_out = self.text_seq2seq.get_encoder()(**batch).last_hidden_state
         pooled = _mean_pool_text(enc_out, batch["attention_mask"])
         z_t_tilde = self.g_t_online(pooled)
