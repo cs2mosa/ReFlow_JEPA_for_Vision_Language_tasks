@@ -11,6 +11,7 @@ below to `.from_pretrained(...)` once real checkpoints are reachable (e.g. on Ka
 which does have internet access if the notebook's "Internet" toggle is on) -- nothing
 else in the codebase needs to change, every module is written against the interface.
 """
+import hashlib
 import torch
 import torch.nn as nn
 from transformers import ViTConfig, ViTModel, T5Config, T5ForConditionalGeneration
@@ -80,18 +81,32 @@ def load_text_encoder(num_layers: int = 2, real_checkpoint: bool = False):
 
 class _MockTokenizer:
     """Deterministic hash-based tokenizer standing in for T5TokenizerFast in this sandbox.
-    Same string -> same ids always; different strings -> (almost certainly) different ids.
-    Swap for the real tokenizer with real_checkpoint=True."""
+    Same string -> same ids always -- INCLUDING across separate process invocations.
+
+    Bug fixed here: this used to use Python's built-in hash(), which is randomized
+    per-process by default (PYTHONHASHSEED) for security reasons. That made token ids
+    for the same caption string DIFFERENT every time a new process started -- so
+    train.py (one process) and diagnose_recon_signal.py (a separate process run later
+    against the saved checkpoint) tokenized the identical caption into different ids.
+    A checkpoint trained against one process's token ids, evaluated with another
+    process's token ids as "ground truth," will look like it has learned nothing --
+    not because it hasn't, but because the labels being checked against were never
+    the labels it was trained on. hashlib.md5 has no such per-process randomization,
+    so ids are now stable across every future process, matching the docstring's
+    original claim (which used to be false in practice)."""
     def __init__(self, vocab_size, max_len=16):
         self.vocab_size = vocab_size
         self.max_len = max_len
+
+    def _stable_hash(self, s: str) -> int:
+        return int(hashlib.md5(s.encode("utf-8")).hexdigest(), 16)
 
     def __call__(self, texts, return_tensors="pt", padding=True):
         if isinstance(texts, str):
             texts = [texts]
         seqs = []
         for t in texts:
-            ids = [1 + (hash((t, i)) % (self.vocab_size - 2)) for i in range(self.max_len)]
+            ids = [1 + (self._stable_hash(f"{t}|{i}") % (self.vocab_size - 2)) for i in range(self.max_len)]
             seqs.append(ids)
         input_ids = torch.tensor(seqs, dtype=torch.long)
         attn = torch.ones_like(input_ids)
