@@ -87,6 +87,17 @@ def main():
         z_true = F.normalize(model.g_t_online(_mean_pool_text(enc_out, batch["attention_mask"])), dim=-1)
         shuffled = z_true[torch.randperm(z_true.shape[0])]
 
+        # --- Sanity cross-check: call the EXACT training code path directly on this
+        # checkpoint. If this ALSO reports a near-baseline recon_loss despite the
+        # training log showing ~0.003 at this step count, the checkpoint itself doesn't
+        # match that log (wrong/stale file, or the run never reached its final
+        # torch.save) -- NOT a bug in this script's manual reimplementation below.
+        _, recon_loss_via_training_step, _, _, _ = model.training_step(images, captions)
+        print(f"[cross-check] recon_loss via model.training_step() directly = "
+              f"{recon_loss_via_training_step.item():.4f}  "
+              f"(compare against the training log's recon_loss at this checkpoint's step)")
+        print()
+
         # --- Check 1: teacher-forced loss ---
         matched_loss = model.text_seq2seq(
             encoder_outputs=(model.prefix_expand(z_true),), labels=true_ids
