@@ -70,7 +70,25 @@ def main():
         visual_layers=args.visual_layers, text_layers=args.text_layers,
         real_checkpoints=args.real_checkpoints,
     ).to(device)
-    model.load_state_dict(torch.load(args.checkpoint_path, map_location=device))
+    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        # new format: carries step count + training args for verification
+        print(f"[checkpoint] step={checkpoint.get('step', '?')}  "
+              f"(cross-check this against the training log's step count -- "
+              f"a mismatch here means you're testing the wrong file)")
+        saved_args = checkpoint.get("args", {})
+        for key in ("predictor_depth", "predictor_heads", "visual_layers", "text_layers",
+                    "real_checkpoints"):
+            if key in saved_args and saved_args[key] != vars(args).get(key):
+                print(f"[checkpoint] WARNING: saved {key}={saved_args[key]} but this "
+                      f"script is using {key}={vars(args).get(key)} -- architecture mismatch "
+                      f"risk, results below may not be meaningful")
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        # old format: raw state_dict, no metadata to verify against
+        print("[checkpoint] WARNING: old-format checkpoint (no step/args metadata saved) "
+              "-- cannot verify this is the checkpoint you think it is")
+        model.load_state_dict(checkpoint)
     model.eval()
 
     ds = SyntheticCaptioningDataset(length=args.batch_size, seed=4321)

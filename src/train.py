@@ -92,10 +92,26 @@ def parse_args():
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--eval-batches", type=int, default=4)
     p.add_argument("--log-path", type=str, default="training_log.json")
+    p.add_argument("--checkpoint-every", type=int, default=250,
+                    help="save a checkpoint every N steps, in addition to the final "
+                         "save. Fixes a real gap: the previous version only saved once, "
+                         "at the very end of the loop -- a Kaggle session timeout or "
+                         "disconnect before that line left only a stale checkpoint from "
+                         "a much earlier (or unrelated) run, with no error to signal it.")
     p.add_argument("--checkpoint-path", type=str, default="reflow_jepa_ckpt.pt")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
+
+
+def save_checkpoint(model, args, step, path):
+    """Saves model weights WITH metadata (step count, args) so a future load can verify
+    what it's actually looking at, instead of silently trusting a possibly-stale file."""
+    torch.save({
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "args": vars(args),
+    }, path)
 
 
 def build_model(args, device):
@@ -234,10 +250,14 @@ def main():
         log.append(diag)
         step += 1
 
+        if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+            save_checkpoint(model, args, step, args.checkpoint_path)
+            print(f"[train] checkpoint saved at step {step} -> {args.checkpoint_path}")
+
     with open(args.log_path, "w") as f:
         json.dump(log, f)
-    torch.save(model.state_dict(), args.checkpoint_path)
-    print(f"[train] done. log -> {args.log_path}, checkpoint -> {args.checkpoint_path}")
+    save_checkpoint(model, args, step, args.checkpoint_path)
+    print(f"[train] done. log -> {args.log_path}, checkpoint -> {args.checkpoint_path} (step {step})")
 
 
 if __name__ == "__main__":
