@@ -34,18 +34,39 @@ def load_visual_encoder(num_layers: int = 2, real_checkpoint: bool = False):
     hidden_size and patch_size.
 
     real_checkpoint=True switches to .from_pretrained (requires internet + hub access,
-    e.g. on Kaggle with the Internet toggle on).
+    e.g. on Kaggle with the Internet toggle on). Verified current as of this writing:
+    "facebook/ijepa_vith14_1k" is a real, presently-hosted checkpoint (HF transformers
+    docs' own I-JEPA usage example uses this exact identifier).
+
+    Returns (model, image_mean, image_std) -- NOT just the model. The mean/std are
+    (1,3,1,1)-shaped tensors for normalizing raw [0,1] images before the encoder sees
+    them. This is necessary and was missing before this fix: our synthetic images
+    (synthetic_data.py's render_shape) are raw [0,1] pixel tensors with NO
+    normalization applied anywhere in the pipeline. That's harmless for the mock path
+    (random weights have no expectation about input distribution), but feeding
+    un-normalized images directly into REAL pretrained I-JEPA weights would produce
+    garbage features -- the encoder was never trained on inputs in that distribution.
+    For real_checkpoint=True, the returned mean/std come from
+    AutoImageProcessor.from_pretrained (the officially documented preprocessing for
+    this checkpoint), not hand-guessed constants. For the mock path, mean=0/std=1
+    (identity, a no-op) so nothing changes for any existing mock-path test.
     """
     if real_checkpoint:
+        from transformers import AutoImageProcessor
         model = ViTModel.from_pretrained("facebook/ijepa_vith14_1k")
+        processor = AutoImageProcessor.from_pretrained("facebook/ijepa_vith14_1k")
+        image_mean = torch.tensor(processor.image_mean).view(1, 3, 1, 1).float()
+        image_std = torch.tensor(processor.image_std).view(1, 3, 1, 1).float()
     else:
         cfg = ViTConfig(
             image_size=224, patch_size=14, hidden_size=D_IJEPA,
             num_hidden_layers=num_layers, num_attention_heads=16, intermediate_size=5120,
         )
         model = ViTModel(cfg)
+        image_mean = torch.zeros(1, 3, 1, 1)
+        image_std = torch.ones(1, 3, 1, 1)
     model.eval()
-    return model
+    return model, image_mean, image_std
 
 
 def load_text_seq2seq(num_layers: int = 2, real_checkpoint: bool = False):

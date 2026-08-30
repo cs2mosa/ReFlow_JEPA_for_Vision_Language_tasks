@@ -90,12 +90,17 @@ def main():
                 print(f"[checkpoint] WARNING: saved {key}={saved_args[key]} but this "
                       f"script is using {key}={vars(args).get(key)} -- architecture mismatch "
                       f"risk, results below may not be meaningful")
-        model.load_state_dict(checkpoint["model_state_dict"])
+        missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        if missing or unexpected:
+            print(f"[checkpoint] WARNING: non-strict load -- missing={missing}, "
+                  f"unexpected={unexpected} (likely an architecture change since this "
+                  f"checkpoint was saved, e.g. buffers added later default correctly "
+                  f"for missing keys; verify results are still meaningful)")
     else:
         # old format: raw state_dict, no metadata to verify against
         print("[checkpoint] WARNING: old-format checkpoint (no step/args metadata saved) "
               "-- cannot verify this is the checkpoint you think it is")
-        model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint, strict=False)
     model.eval()
 
     ds = SyntheticCaptioningDataset(length=args.batch_size, seed=4321)
@@ -124,11 +129,17 @@ def main():
         print()
 
         # --- Check 1: teacher-forced loss ---
+        # Mask padding with -100, same fix as reflow_jepa.py's training_step -- see
+        # its docstring. Harmless no-op for the mock tokenizer (attention_mask always
+        # all-ones); required once a real tokenizer produces padded, variable-length
+        # sequences.
+        masked_labels = true_ids.clone()
+        masked_labels[batch["attention_mask"] == 0] = -100
         matched_loss = model.text_seq2seq(
-            encoder_outputs=(model.prefix_expand(z_true),), labels=true_ids
+            encoder_outputs=(model.prefix_expand(z_true),), labels=masked_labels
         ).loss
         mismatched_loss = model.text_seq2seq(
-            encoder_outputs=(model.prefix_expand(shuffled),), labels=true_ids
+            encoder_outputs=(model.prefix_expand(shuffled),), labels=masked_labels
         ).loss
 
         z_std = z_true.std(dim=0).mean().item()
@@ -151,13 +162,45 @@ def main():
     # --- Check 3: end-to-end, using the flow's OWN integrated output, not the true z_t ---
     flow_gen = greedy_decode(model, z_hat, args.max_new_tokens, device)
 
-    n = min(matched_gen.shape[1], true_ids.shape[1])
-    matched_tok_acc = (matched_gen[:, :n] == true_ids[:, :n]).float().mean().item()
-    mismatched_tok_acc = (mismatched_gen[:, :n] == true_ids[:, :n]).float().mean().item()
-    matched_seq_acc = (matched_gen[:, :n] == true_ids[:, :n]).all(dim=1).float().mean().item()
-    mismatched_seq_acc = (mismatched_gen[:, :n] == true_ids[:, :n]).all(dim=1).float().mean().item()
-    flow_tok_acc = (flow_gen[:, :n] == true_ids[:, :n]).float().mean().item()
-    flow_seq_acc = (flow_gen[:, :n] == true_ids[:, :n]).all(dim=1).float().mean().item()
+    # Mask-aware comparison, not a blanket length truncation: greedy_decode always
+    # generates exactly args.max_new_tokens tokens (it never stops at EOS), while
+    # true_ids' length is whatever the tokenizer produced for this batch. For the mock
+    # tokenizer this is moot (fixed length 16, attention_mask always all-ones -- this
+    # reduces to exactly the old n=min(...) behavior). For a REAL tokenizer, caption
+    # length genuinely varies (e.g. "the center" vs "the bottom right" tokenize to
+    # different lengths) and shorter captions get padded -- comparing against those
+    # padded positions would be comparing against content the model was never trained
+    # to predict there (training now correctly masks padding from the loss). Pad/trim
+    # generated sequences to true_ids' length, then use each example's own
+    # attention_mask to only score real (non-padding) positions.
+    L = true_ids.shape[1]
+    pad_id = model.text_seq2seq.config.pad_token_id
+
+    def align_to_true_length(gen):
+        if gen.shape[1] < L:
+            return F.pad(gen, (0, L - gen.shape[1]), value=pad_id)
+        return gen[:, :L]
+
+    matched_gen = align_to_true_length(matched_gen)
+    mismatched_gen = align_to_true_length(mismatched_gen)
+    flow_gen = align_to_true_length(flow_gen)
+    mask = batch["attention_mask"].bool()  # (B, L), True at real (non-padding) positions
+    n_real = mask.sum().clamp(min=1).float()
+
+    def masked_tok_acc(gen):
+        return ((gen == true_ids) & mask).sum().float().div(n_real).item()
+
+    def masked_seq_acc(gen):
+        # a sequence counts as an exact match if every REAL (non-padding) position
+        # matches -- padding positions never break an otherwise-correct match
+        return ((gen == true_ids) | ~mask).all(dim=1).float().mean().item()
+
+    matched_tok_acc = masked_tok_acc(matched_gen)
+    mismatched_tok_acc = masked_tok_acc(mismatched_gen)
+    matched_seq_acc = masked_seq_acc(matched_gen)
+    mismatched_seq_acc = masked_seq_acc(mismatched_gen)
+    flow_tok_acc = masked_tok_acc(flow_gen)
+    flow_seq_acc = masked_seq_acc(flow_gen)
 
     print("=== Check 1: teacher-forced loss ===")
     print(f"matched (true embedding) recon loss     = {matched_loss.item():.4f}")

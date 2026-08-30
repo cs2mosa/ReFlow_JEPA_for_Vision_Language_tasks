@@ -129,9 +129,14 @@ def main():
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         print(f"[checkpoint] step={checkpoint.get('step', '?')}")
-        model.load_state_dict(checkpoint["model_state_dict"])
+        missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        if missing or unexpected:
+            print(f"[checkpoint] WARNING: non-strict load -- missing={missing}, "
+                  f"unexpected={unexpected} (likely an architecture change since this "
+                  f"checkpoint was saved, e.g. buffers added later default correctly "
+                  f"for missing keys; verify results are still meaningful)")
     else:
-        model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint, strict=False)
     model.eval()
 
     ds = SyntheticCaptioningDataset(length=args.batch_size, seed=13579)

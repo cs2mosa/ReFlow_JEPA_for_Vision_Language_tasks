@@ -81,8 +81,14 @@ class ReflowJEPA(nn.Module):
         self.freeze_text_encoder = freeze_text_encoder
         self.stop_grad_cfm_target = stop_grad_cfm_target
 
-        # Frozen visual encoder E_V
-        self.visual_encoder = load_visual_encoder(num_layers=visual_layers, real_checkpoint=real_checkpoints)
+        # Frozen visual encoder E_V. image_mean/image_std normalize raw [0,1] images
+        # before the encoder sees them -- see load_visual_encoder's docstring: this is
+        # a no-op (mean=0, std=1) for the mock path, and the officially documented
+        # AutoImageProcessor stats for the real-checkpoint path.
+        self.visual_encoder, image_mean, image_std = load_visual_encoder(
+            num_layers=visual_layers, real_checkpoint=real_checkpoints)
+        self.register_buffer("image_mean", image_mean)
+        self.register_buffer("image_std", image_std)
         for p in self.visual_encoder.parameters():
             p.requires_grad_(False)
 
@@ -206,6 +212,7 @@ class ReflowJEPA(nn.Module):
 
     @torch.no_grad()
     def _visual_forward(self, images: torch.Tensor) -> torch.Tensor:
+        images = (images - self.image_mean) / self.image_std
         out = self.visual_encoder(images).last_hidden_state
         return _extract_patch_tokens(out)
 
@@ -320,7 +327,15 @@ class ReflowJEPA(nn.Module):
 
         Z1 = z_t_tilde  # non-detached: recon_loss and vicreg_t below DO shape g_T
         recon_prefix = self.prefix_expand(Z1)
-        recon_out = self.text_seq2seq(encoder_outputs=(recon_prefix,), labels=batch["input_ids"])
+        # Mask padding positions with -100 (HF's ignore_index convention) before
+        # computing the reconstruction loss. Harmless no-op with the mock tokenizer
+        # (fixed-length, attention_mask is always all-ones -- nothing gets masked),
+        # but REQUIRED once a real tokenizer produces variable-length, padded
+        # sequences: without this, padding tokens get trained on as if they were real
+        # targets, silently corrupting the loss.
+        labels = batch["input_ids"].clone()
+        labels[batch["attention_mask"] == 0] = -100
+        recon_out = self.text_seq2seq(encoder_outputs=(recon_prefix,), labels=labels)
         recon_loss = recon_out.loss
 
         vicreg_v = vicreg_variance_penalty(z_v_tilde, gamma_0=vicreg_gamma)
@@ -368,7 +383,9 @@ class ReflowJEPA(nn.Module):
         else:
             cfm_loss = (v_pred - (Z1_for_cfm - Z0)).pow(2).sum(dim=-1).mean()
         recon_prefix = self.prefix_expand(Z1)
-        recon_loss = self.text_seq2seq(encoder_outputs=(recon_prefix,), labels=batch["input_ids"]).loss
+        labels = batch["input_ids"].clone()
+        labels[batch["attention_mask"] == 0] = -100
+        recon_loss = self.text_seq2seq(encoder_outputs=(recon_prefix,), labels=labels).loss
         vicreg_t = vicreg_variance_penalty(Z1, gamma_0=vicreg_gamma)
         vicreg_v = vicreg_variance_penalty(z_v_tilde, gamma_0=vicreg_gamma)
 
