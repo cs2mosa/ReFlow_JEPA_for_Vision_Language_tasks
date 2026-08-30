@@ -146,8 +146,17 @@ class ReflowJEPA(nn.Module):
         real bug found in practice: the mock (and real HF) tokenizer always returns
         CPU tensors regardless of model device, causing a device-mismatch crash on any
         GPU run. Previously patched ad hoc after each of 4 separate call sites -- this
-        consolidates it into one place so a 5th call site can't silently miss it."""
-        batch = self.tokenizer(captions)
+        consolidates it into one place so a 5th call site can't silently miss it.
+
+        return_tensors="pt" and padding=True are passed EXPLICITLY here, not left to
+        the tokenizer's own default. A second real bug found in practice: the mock
+        tokenizer's __call__ signature defaults return_tensors="pt" and always returns
+        tensors regardless of what's actually passed in, so calling it with no
+        arguments happened to work by accident. Real T5TokenizerFast's actual default
+        is return_tensors=None, which returns plain Python lists -- .to(device) on a
+        list crashes immediately. Being explicit here removes the dependency on
+        whichever tokenizer's particular defaults happen to line up."""
+        batch = self.tokenizer(captions, return_tensors="pt", padding=True)
         device = self.task_token.device
         return {k: v.to(device) for k, v in batch.items()}
 

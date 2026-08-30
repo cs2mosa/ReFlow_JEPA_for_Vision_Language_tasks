@@ -189,7 +189,7 @@ def evaluate_manifold_adherence(model, images, captions, n_steps=30, eps_frac=0.
     fixed regardless of how spread out (or not) the targets currently are.
     """
     z_hat = model.integrate(images, n_steps=n_steps)
-    batch = model.tokenizer(captions)
+    batch = model.tokenizer(captions, return_tensors="pt", padding=True)
     batch = {k: v.to(images.device) for k, v in batch.items()}  # tokenizer always returns
                                                                   # CPU tensors -- see
                                                                   # ReflowJEPA._tokenize's

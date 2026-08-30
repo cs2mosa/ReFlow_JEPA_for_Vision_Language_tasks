@@ -108,7 +108,7 @@ def main():
     images, captions = next(iter(dl))
     images = images.to(device)
 
-    batch = model.tokenizer(captions)
+    batch = model.tokenizer(captions, return_tensors="pt", padding=True)
     batch = {k: v.to(device) for k, v in batch.items()}
     true_ids = batch["input_ids"]
 

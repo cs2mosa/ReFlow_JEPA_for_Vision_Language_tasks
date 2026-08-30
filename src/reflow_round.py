@@ -187,7 +187,7 @@ def evaluate_end_to_end(model, args, device):
     images, captions = next(iter(dl))
     images = images.to(device)
 
-    batch = model.tokenizer(captions)
+    batch = model.tokenizer(captions, return_tensors="pt", padding=True)
     batch = {k: v.to(device) for k, v in batch.items()}
     enc_out = model.text_seq2seq.get_encoder()(**batch).last_hidden_state
     z_true = F.normalize(model.g_t_online(_mean_pool_text(enc_out, batch["attention_mask"])), dim=-1)
