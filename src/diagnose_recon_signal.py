@@ -61,6 +61,9 @@ def main():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--max-new-tokens", type=int, default=16, help="must match the mock "
                     "tokenizer's max_len (16) for exact-match comparison to align")
+    p.add_argument("--integrate-steps", type=int, default=50,
+                    help="Euler steps for the flow's own integrate() call in Check 3 "
+                         "(the actual inference-time path, not a diagnostic shortcut)")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
@@ -126,15 +129,31 @@ def main():
 
         z_std = z_true.std(dim=0).mean().item()
 
+        # --- Check 3 setup: the ACTUAL end-to-end inference path -- integrate() (the
+        # trained flow, starting from noise) -> prefix_expand -> decode. Everything
+        # above used the TRUE z_t and only tested the decoder in isolation; this is the
+        # first check that also exercises whether the FLOW itself converges close
+        # enough to produce usable captions in real inference, which is a separate
+        # question decoder-only checks can't answer.
+        z_hat = model.integrate(images, n_steps=args.integrate_steps)
+        z_hat_norm = z_hat.norm(dim=-1).mean().item()
+        z_true_norm = z_true.norm(dim=-1).mean().item()
+        dist_to_true = (z_hat - z_true).norm(dim=-1).mean().item()
+
     # --- Check 2: genuine autoregressive generation accuracy ---
     matched_gen = greedy_decode(model, z_true, args.max_new_tokens, device)
     mismatched_gen = greedy_decode(model, shuffled, args.max_new_tokens, device)
+
+    # --- Check 3: end-to-end, using the flow's OWN integrated output, not the true z_t ---
+    flow_gen = greedy_decode(model, z_hat, args.max_new_tokens, device)
 
     n = min(matched_gen.shape[1], true_ids.shape[1])
     matched_tok_acc = (matched_gen[:, :n] == true_ids[:, :n]).float().mean().item()
     mismatched_tok_acc = (mismatched_gen[:, :n] == true_ids[:, :n]).float().mean().item()
     matched_seq_acc = (matched_gen[:, :n] == true_ids[:, :n]).all(dim=1).float().mean().item()
     mismatched_seq_acc = (mismatched_gen[:, :n] == true_ids[:, :n]).all(dim=1).float().mean().item()
+    flow_tok_acc = (flow_gen[:, :n] == true_ids[:, :n]).float().mean().item()
+    flow_seq_acc = (flow_gen[:, :n] == true_ids[:, :n]).all(dim=1).float().mean().item()
 
     print("=== Check 1: teacher-forced loss ===")
     print(f"matched (true embedding) recon loss     = {matched_loss.item():.4f}")
@@ -146,6 +165,16 @@ def main():
     print("=== Check 2: genuine autoregressive generation (no teacher forcing) ===")
     print(f"matched    -- per-token acc: {matched_tok_acc:.4f}   full-sequence exact-match: {matched_seq_acc:.4f}")
     print(f"mismatched -- per-token acc: {mismatched_tok_acc:.4f}   full-sequence exact-match: {mismatched_seq_acc:.4f}")
+    print()
+    print("=== Check 3: end-to-end (integrate() -> prefix_expand -> decode) ===")
+    print(f"mean ||z_hat|| (flow output, {args.integrate_steps} Euler steps) = {z_hat_norm:.4f}   "
+          f"mean ||z_true|| = {z_true_norm:.4f}  "
+          f"({'norm has drifted noticeably from the target -- see note below' if abs(z_hat_norm - z_true_norm) > 0.1 else 'norms close, drift is not the issue here'})")
+    print(f"mean dist(z_hat, z_true)               = {dist_to_true:.4f}")
+    print(f"flow-based generation -- per-token acc: {flow_tok_acc:.4f}   full-sequence exact-match: {flow_seq_acc:.4f}")
+    print(f"  (compare against Check 2's matched={matched_tok_acc:.4f} -- the gap between them is "
+          f"exactly what the flow's imperfect convergence costs you in real inference, isolated from "
+          f"whether the decoder itself works, which Check 2 already answered)")
     print()
 
     teacher_forced_gap_small = (mismatched_loss - matched_loss).item() < 0.05
