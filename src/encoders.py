@@ -52,8 +52,16 @@ def load_visual_encoder(num_layers: int = 2, real_checkpoint: bool = False):
     (identity, a no-op) so nothing changes for any existing mock-path test.
     """
     if real_checkpoint:
-        from transformers import AutoImageProcessor
-        model = ViTModel.from_pretrained("facebook/ijepa_vith14_1k")
+        from transformers import AutoImageProcessor, IJepaModel
+        # NOT ViTModel: real I-JEPA has no CLS token and no pooler (confirmed directly
+        # by a real error from an earlier attempt using ViTModel.from_pretrained here --
+        # it reported missing pooler.dense.*/embeddings.cls_token and a position-
+        # embeddings shape of [1,256,1280] vs ViTModel's expected [1,257,1280], i.e.
+        # exactly "256 patches, no CLS token prepended." transformers ships a dedicated
+        # IJepaModel/IJepaConfig class for exactly this architecture difference.
+        # _extract_patch_tokens() below already handles both cases (256 or 257 tokens)
+        # so no other code needs to change once this loads with the right class.
+        model = IJepaModel.from_pretrained("facebook/ijepa_vith14_1k")
         processor = AutoImageProcessor.from_pretrained("facebook/ijepa_vith14_1k")
         image_mean = torch.tensor(processor.image_mean).view(1, 3, 1, 1).float()
         image_std = torch.tensor(processor.image_std).view(1, 3, 1, 1).float()
