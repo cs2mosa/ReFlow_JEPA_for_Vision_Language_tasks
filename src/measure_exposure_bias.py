@@ -17,10 +17,20 @@ found and fixed once for the decoder's teacher forcing.
 Two comparisons, both at matched tau using the identical Z0:
   1. ||Z_tau|| under training-interpolation vs under real integration -- does the
      trajectory actually leave the training distribution's support.
-  2. The predictor's OWN residual error (||v_pred - true target||) evaluated at the
-     training point vs at the inference point, for the identical target direction --
-     if the network extrapolates poorly, residual_infer >> residual_train even though
-     both are being asked for the same underlying displacement.
+  2. The predictor's OWN residual error, evaluated at the training point vs the
+     inference point -- if the network extrapolates poorly, residual_infer >>
+     residual_train even though both are being asked about the same underlying target.
+
+BUG FIXED after the EDM-preconditioned architecture was introduced: this originally
+computed the residual as ||v_pred - (Z1-Z0)|| directly on the raw velocity output. For
+edm_precondition=True, v_pred is STRUCTURALLY (Z1-Z0) + eps/(1-tau) where eps is the
+network's target-estimate error -- so this residual is amplified by 1/(1-tau)
+regardless of how good the network actually is, growing unboundedly near tau=1 even
+for a well-trained model. This produced misleadingly alarming numbers (resid_train
+reaching 60+ by tau=0.999) that reflected the amplification artifact, not genuine
+error. Fixed to match reflow_jepa.py's training_step and reflow_round.py: recover the
+bounded target-estimate z1_hat algebraically and compare THAT to the true target,
+which stays close to its true bounded scale (<=~4) regardless of tau.
 
 Usage:
     python measure_exposure_bias.py --checkpoint-path /kaggle/working/reflow_jepa_ckpt.pt \
@@ -61,6 +71,22 @@ def integrate_from_z0_capturing(model, Z0, z_v_tilde, c, capture_taus, n_steps, 
 
     captured["final"] = (Z.clone(), taus[-1].clone())
     return captured
+
+
+@torch.no_grad()
+def compute_residual(model, Z_point, tau_batch, z_v_tilde, c, Z1_true, Z0):
+    """Same branch as reflow_jepa.py's training_step: for edm_precondition=True,
+    recover the bounded target-estimate algebraically (z1_hat = v_pred*(1-tau) +
+    Z_point) and compare THAT to the true target -- avoids ever constructing the
+    tau-amplified raw quantity. For edm_precondition=False, unchanged: residual is
+    computed directly against the (Z1-Z0) velocity target."""
+    v_pred = model.predictor(Z_point, tau_batch, z_v_tilde, c)
+    if model.predictor.edm_precondition:
+        z1_hat = v_pred * (1 - tau_batch).unsqueeze(-1) + Z_point
+        return (z1_hat - Z1_true).norm(dim=-1).mean().item()
+    else:
+        target_direction = Z1_true - Z0
+        return (v_pred - target_direction).norm(dim=-1).mean().item()
 
 
 def main():
@@ -110,8 +136,6 @@ def main():
         enc_out = model.text_seq2seq.get_encoder()(**batch).last_hidden_state
         Z1_true = F.normalize(model.g_t_online(_mean_pool_text(enc_out, batch["attention_mask"])), dim=-1)
 
-        target_direction = Z1_true - Z0  # the (Z1 - Z0) regression target, same for every tau
-
     capture_taus = [0.0, 0.5, 0.9, 0.99, 0.999, 1 - 2e-3]
     print(f"\n[integrate] running {args.n_steps}-step trajectory from the SAME Z0 used "
           f"for the training-style comparison below, capturing at tau = {capture_taus}")
@@ -133,10 +157,8 @@ def main():
             norm_infer = Z_infer.norm(dim=-1).mean().item()
             dist_train_infer = (Z_train - Z_infer).norm(dim=-1).mean().item()
 
-            v_pred_train = model.predictor(Z_train, tau_batch, z_v_tilde, c)
-            v_pred_infer = model.predictor(Z_infer, tau_batch, z_v_tilde, c)
-            resid_train = (v_pred_train - target_direction).norm(dim=-1).mean().item()
-            resid_infer = (v_pred_infer - target_direction).norm(dim=-1).mean().item()
+            resid_train = compute_residual(model, Z_train, tau_batch, z_v_tilde, c, Z1_true, Z0)
+            resid_infer = compute_residual(model, Z_infer, tau_batch, z_v_tilde, c, Z1_true, Z0)
             ratio = resid_infer / resid_train if resid_train > 1e-8 else float("inf")
 
         print(f"{tau_val:>10.4f}  {norm_train:>12.4f}  {norm_infer:>12.4f}  {dist_train_infer:>18.4f}  "
@@ -146,9 +168,12 @@ def main():
     print("INTERPRETATION GUIDE:")
     print("  ||Z_train|| vs ||Z_infer|| diverging substantially by tau~0.5 -> the real ")
     print("  trajectory leaves the training distribution's support early, not just near tau=1.")
+    print("  resid_train/resid_infer now measured in the BOUNDED target-estimate space")
+    print("  (z1_hat vs Z1_true, not raw velocity) for edm_precondition=True checkpoints --")
+    print("  should stay roughly bounded (<=~4) at every tau for a well-trained network.")
     print("  resid ratio >> 1 at the same tau -> the predictor's error is genuinely larger")
     print("  off-distribution (at the point integration actually visits) than on-distribution")
-    print("  (at the point training actually trained on) for the SAME target direction --")
+    print("  (at the point training actually trained on) for the SAME true target --")
     print("  direct confirmation the network is extrapolating poorly outside what it saw.")
 
 
