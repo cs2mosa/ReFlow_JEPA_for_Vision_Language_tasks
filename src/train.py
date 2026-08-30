@@ -17,6 +17,7 @@ Usage:
 """
 import argparse
 import json
+import math
 import os
 import time
 
@@ -33,6 +34,19 @@ def parse_args():
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr-schedule", type=str, default="cosine", choices=["constant", "cosine"],
+                    help="'cosine' (default): linear warmup then cosine decay to "
+                         "--min-lr-ratio * lr. Motivated directly by a real run: cfm_loss "
+                         "plateaued flat and noisy from ~step 800 onward at a constant LR "
+                         "-- the classic signature of an LR too large to settle further, "
+                         "not too small to ever converge. 'constant' keeps the old behavior.")
+    p.add_argument("--warmup-steps", type=int, default=100,
+                    help="linear LR warmup steps before the schedule kicks in (ignored if "
+                         "--lr-schedule constant)")
+    p.add_argument("--min-lr-ratio", type=float, default=0.05,
+                    help="cosine decay floor, as a fraction of --lr (not decayed to exactly "
+                         "0 -- leaves the network some ability to keep adjusting late in "
+                         "training rather than effectively freezing)")
     p.add_argument("--sigma", type=float, default=0.02,
                     help="stochastic source noise scale. Recalibrated for L2-normalized "
                          "(unit-sphere) embeddings: at sigma=0.02, E[||sigma*eps||]~0.55 "
@@ -114,6 +128,21 @@ def save_checkpoint(model, args, step, path):
     }, path)
 
 
+def build_lr_scheduler(optimizer, args):
+    if args.lr_schedule == "constant":
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+
+    def lr_lambda(step):
+        if step < args.warmup_steps:
+            return (step + 1) / max(1, args.warmup_steps)
+        progress = (step - args.warmup_steps) / max(1, args.steps - args.warmup_steps)
+        progress = min(1.0, progress)
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+        return args.min_lr_ratio + (1 - args.min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
 def build_model(args, device):
     model = ReflowJEPA(
         k_query=args.k_query,
@@ -191,6 +220,7 @@ def main():
     )
 
     optimizer = torch.optim.AdamW(model.parameter_groups(args.lr, args.decoder_lr_mult))
+    scheduler = build_lr_scheduler(optimizer, args)
 
     log = []
     step = 0
@@ -220,14 +250,16 @@ def main():
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), max_norm=5.0)
         optimizer.step()
+        scheduler.step()
         model.update_ema_target()
 
         diag["total_loss"] = total_loss.item()
         diag["step"] = step
         diag["elapsed_s"] = time.time() - t0
+        diag["lr"] = scheduler.get_last_lr()[0]  # core param group's current LR
 
         if step % max(1, args.steps // 50) == 0:
-            print(f"[step {step:5d}] total={diag['total_loss']:.4f} cfm={diag['cfm_loss']:.4f} "
+            print(f"[step {step:5d}] lr={diag['lr']:.2e} total={diag['total_loss']:.4f} cfm={diag['cfm_loss']:.4f} "
                   f"recon={diag['recon_loss']:.4f} vicreg_v={diag['vicreg_v']:.4f} "
                   f"vicreg_t={diag['vicreg_t']:.4f}")
 
