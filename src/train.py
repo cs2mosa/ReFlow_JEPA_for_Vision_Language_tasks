@@ -103,6 +103,16 @@ def parse_args():
     p.add_argument("--real-checkpoints", action="store_true",
                     help="use real I-JEPA/T5 checkpoints instead of config-matched random weights "
                          "(needs internet access, e.g. Kaggle with the Internet toggle on)")
+    p.add_argument("--edm-precondition", type=lambda x: x.lower() != "false", default=True,
+                    help="EDM-style predictor reparametrization (default True): predict "
+                         "a bounded target-embedding estimate and compute velocity "
+                         "analytically as (z1_hat - z_tau)/(1-tau), baking the 1/(1-tau) "
+                         "terminal divergence into the architecture rather than relying "
+                         "on gradient descent to learn it. Added after "
+                         "measure_terminal_divergence.py found the raw-velocity "
+                         "architecture hadn't reliably learned this on a real "
+                         "checkpoint. Pass --edm-precondition false to revert to the "
+                         "original architecture for comparison.")
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--eval-batches", type=int, default=4)
     p.add_argument("--log-path", type=str, default="training_log.json")
@@ -154,6 +164,7 @@ def build_model(args, device):
         sigma=args.sigma,
         ema_momentum=args.ema_momentum,
         real_checkpoints=args.real_checkpoints,
+        edm_precondition=args.edm_precondition,
         freeze_text_encoder=args.freeze_text_encoder,
         stop_grad_cfm_target=args.stop_grad_cfm_target,
     ).to(device)

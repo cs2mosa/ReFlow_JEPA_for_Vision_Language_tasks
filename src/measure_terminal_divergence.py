@@ -110,6 +110,9 @@ def main():
     p.add_argument("--visual-layers", type=int, default=4)
     p.add_argument("--text-layers", type=int, default=4)
     p.add_argument("--real-checkpoints", action="store_true")
+    p.add_argument("--edm-precondition", type=lambda x: x.lower() != "false", default=True,
+                    help="must match whatever the loaded checkpoint was trained with -- "
+                         "see train.py --help for what this changes")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--n-steps", type=int, default=500)
     p.add_argument("--power-iters", type=int, default=15)
@@ -121,6 +124,7 @@ def main():
         predictor_depth=args.predictor_depth, predictor_heads=args.predictor_heads,
         visual_layers=args.visual_layers, text_layers=args.text_layers,
         real_checkpoints=args.real_checkpoints,
+        edm_precondition=args.edm_precondition,
     ).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:

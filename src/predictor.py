@@ -21,6 +21,7 @@ sequence later).
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -69,9 +70,33 @@ class AdaLNZeroBlock(nn.Module):
 
 
 class VelocityPredictor(nn.Module):
-    def __init__(self, d_shared: int = 768, depth: int = 6, n_heads: int = 8):
+    def __init__(self, d_shared: int = 768, depth: int = 6, n_heads: int = 8,
+                 edm_precondition: bool = False):
+        """edm_precondition=False (default): the original architecture, network output
+        IS the velocity directly, DiT-Zero-initialized so v=0 at init.
+
+        edm_precondition=True: EDM-style reparametrization (Karras et al. 2022, cited
+        in OFM-JEPA v2 as a candidate fix, never previously implemented here). Instead
+        of predicting velocity directly, the network predicts an estimate of the
+        TARGET embedding z1_hat (bounded, lives near the unit sphere -- a far easier
+        quantity to learn than a velocity that must diverge as tau->1), and velocity is
+        computed ANALYTICALLY as (z1_hat - z_tau) / (1 - tau). This bakes the
+        1/(1-tau) terminal divergence (test_08's validated exact-field rate) into the
+        architecture structurally -- it no longer needs to be learned via gradient
+        descent, which measure_terminal_divergence.py found the raw-velocity
+        architecture had NOT reliably learned on a real trained network, at a real
+        checkpoint, regardless of Reflow or more integration steps.
+
+        Motivated directly by a persistent, repeated finding: ||z_hat|| (the flow's
+        integrated output) plateaued around 0.45-0.50 against a target norm of 1.0,
+        unmoved by an LR schedule, a Reflow round, or 10x more integration steps.
+        Forcing z1_hat onto the unit sphere via F.normalize means the terminal norm is
+        correct BY CONSTRUCTION once the network's target-estimate is even roughly
+        right, rather than depending on the network having learned the correct
+        diverging magnitude from scratch."""
         super().__init__()
         self.d = d_shared
+        self.edm_precondition = edm_precondition
         self.time_embed = SinusoidalTimeEmbedding(d_shared)
         self.blocks = nn.ModuleList([AdaLNZeroBlock(d_shared, n_heads) for _ in range(depth)])
         self.final_norm = nn.LayerNorm(d_shared, elementwise_affine=False)
@@ -80,7 +105,12 @@ class VelocityPredictor(nn.Module):
         nn.init.zeros_(self.final_ada_ln[-1].bias)
         self.head = nn.Linear(d_shared, d_shared)
         nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)  # predictor starts near v=0, standard DiT-Zero init
+        nn.init.zeros_(self.head.bias)
+        # edm_precondition=False: zero-init head -> v=0 at init (standard DiT-Zero).
+        # edm_precondition=True: zero-init head -> z1_hat = normalize(z_v_tilde + 0)
+        # = z_v_tilde at init (a sensible, well-defined, non-degenerate starting
+        # guess -- "the target looks like the visual embedding" -- rather than the
+        # zero vector, which normalize() cannot sensibly handle).
 
     def forward(self, z_tau: torch.Tensor, tau: torch.Tensor,
                 z_v_tilde: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -92,4 +122,11 @@ class VelocityPredictor(nn.Module):
             x = block(x, memory, t_emb)
         shift, scale = self.final_ada_ln(t_emb).chunk(2, dim=-1)
         h = self.final_norm(x.squeeze(1)) * (1 + scale) + shift
-        return self.head(h)                                             # (B, d)
+        raw = self.head(h)                                             # (B, d)
+
+        if not self.edm_precondition:
+            return raw
+
+        z1_hat = F.normalize(z_v_tilde + raw, dim=-1)
+        denom = (1 - tau).clamp(min=1e-4).unsqueeze(-1)
+        return (z1_hat - z_tau) / denom

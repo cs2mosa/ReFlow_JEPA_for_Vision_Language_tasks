@@ -73,6 +73,7 @@ class ReflowJEPA(nn.Module):
         real_checkpoints: bool = False,
         freeze_text_encoder: bool = True,
         stop_grad_cfm_target: bool = True,
+        edm_precondition: bool = True,
     ):
         super().__init__()
         self.sigma = sigma
@@ -116,8 +117,17 @@ class ReflowJEPA(nn.Module):
             self.text_encoder_target = make_ema_copy(self.text_seq2seq.get_encoder())
         self.g_t_target = make_ema_copy(self.g_t_online)
 
-        # Predictor v_theta
-        self.predictor = VelocityPredictor(d_shared=d_shared, depth=predictor_depth, n_heads=predictor_heads)
+        # Predictor v_theta. edm_precondition=True by default (predictor.py's
+        # EDM-style reparametrization, added directly in response to
+        # measure_terminal_divergence.py's finding that the raw-velocity architecture's
+        # terminal divergence, measured on a real trained checkpoint, did not reliably
+        # track the theoretical 1/(1-tau) rate -- unmoved by an LR schedule, a Reflow
+        # round, or 10x more integration steps. See predictor.py's docstring for the
+        # reparametrization itself, and test_13_edm_predictor.py for what's verified
+        # about it (including a corrected initial hypothesis about gradient warmup).
+        self.predictor = VelocityPredictor(d_shared=d_shared, depth=predictor_depth,
+                                            n_heads=predictor_heads,
+                                            edm_precondition=edm_precondition)
 
         # Decoder-side: Prefix-Expand + the text model's own (paired) decoder
         self.prefix_expand = PrefixExpand(d_shared=d_shared, k_prefix=k_prefix)
@@ -290,7 +300,23 @@ class ReflowJEPA(nn.Module):
         Z_tau = (1 - tau).unsqueeze(-1) * Z0 + tau.unsqueeze(-1) * Z1_for_cfm
 
         v_pred = self.predictor(Z_tau, tau, z_v_tilde, c)   # conditioning: full gradient, NOT z_v_for_source
-        cfm_loss = (v_pred - (Z1_for_cfm - Z0)).pow(2).sum(dim=-1).mean()
+
+        if self.predictor.edm_precondition:
+            # On the training distribution, Z_tau EXACTLY interpolates Z0->Z1_for_cfm,
+            # so if the network's bounded target-estimate z1_hat has prediction error
+            # eps, then v_pred = (Z1_for_cfm - Z0) + eps/(1-tau) -- ANY imperfection in
+            # z1_hat gets amplified by 1/(1-tau), unboundedly as tau->1. This is not
+            # hypothetical: an early smoke test of this architecture produced a real
+            # cfm_loss spike above 500,000 the first time a sampled tau landed very
+            # close to 1 while z1_hat was still imperfect (normal, especially early in
+            # training). Fix: algebraically recover z1_hat from v_pred (exact
+            # inversion: v_pred = (z1_hat - Z_tau)/(1-tau) => z1_hat = v_pred*(1-tau) +
+            # Z_tau) and supervise THAT directly -- same information content, but
+            # without ever constructing the amplified quantity during training.
+            z1_hat = v_pred * (1 - tau).unsqueeze(-1) + Z_tau
+            cfm_loss = (z1_hat - Z1_for_cfm).pow(2).sum(dim=-1).mean()
+        else:
+            cfm_loss = (v_pred - (Z1_for_cfm - Z0)).pow(2).sum(dim=-1).mean()
 
         Z1 = z_t_tilde  # non-detached: recon_loss and vicreg_t below DO shape g_T
         recon_prefix = self.prefix_expand(Z1)
@@ -336,7 +362,11 @@ class ReflowJEPA(nn.Module):
         tau = torch.rand(B, device=images.device)
         Z_tau = (1 - tau).unsqueeze(-1) * Z0 + tau.unsqueeze(-1) * Z1_for_cfm
         v_pred = self.predictor(Z_tau, tau, z_v_tilde, c)
-        cfm_loss = (v_pred - (Z1_for_cfm - Z0)).pow(2).sum(dim=-1).mean()
+        if self.predictor.edm_precondition:
+            z1_hat = v_pred * (1 - tau).unsqueeze(-1) + Z_tau
+            cfm_loss = (z1_hat - Z1_for_cfm).pow(2).sum(dim=-1).mean()
+        else:
+            cfm_loss = (v_pred - (Z1_for_cfm - Z0)).pow(2).sum(dim=-1).mean()
         recon_prefix = self.prefix_expand(Z1)
         recon_loss = self.text_seq2seq(encoder_outputs=(recon_prefix,), labels=batch["input_ids"]).loss
         vicreg_t = vicreg_variance_penalty(Z1, gamma_0=vicreg_gamma)

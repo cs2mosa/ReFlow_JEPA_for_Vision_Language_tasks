@@ -49,6 +49,9 @@ def parse_args():
     p.add_argument("--visual-layers", type=int, default=4)
     p.add_argument("--text-layers", type=int, default=4)
     p.add_argument("--real-checkpoints", action="store_true")
+    p.add_argument("--edm-precondition", type=lambda x: x.lower() != "false", default=True,
+                    help="must match whatever the loaded checkpoint was trained with -- "
+                         "see train.py --help for what this changes")
     p.add_argument("--sigma", type=float, default=0.02)
 
     p.add_argument("--reflow-dataset-size", type=int, default=4096,
@@ -85,6 +88,7 @@ def load_model(args, device):
         predictor_depth=args.predictor_depth, predictor_heads=args.predictor_heads,
         visual_layers=args.visual_layers, text_layers=args.text_layers,
         real_checkpoints=args.real_checkpoints,
+        edm_precondition=args.edm_precondition,
     ).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
@@ -233,7 +237,14 @@ def main():
         tau = torch.rand(B, device=device)
         Z_tau = (1 - tau).unsqueeze(-1) * Z0_b + tau.unsqueeze(-1) * Zhat1_b
         v_pred = model.predictor(Z_tau, tau, Zv_b, c)
-        loss = (v_pred - (Zhat1_b - Z0_b)).pow(2).sum(dim=-1).mean()
+        if model.predictor.edm_precondition:
+            # Same fix as reflow_jepa.py's training_step -- see its docstring for the
+            # full derivation. Recovers the bounded target-estimate algebraically
+            # instead of supervising the (tau-amplified) raw velocity directly.
+            z1_hat = v_pred * (1 - tau).unsqueeze(-1) + Z_tau
+            loss = (z1_hat - Zhat1_b).pow(2).sum(dim=-1).mean()
+        else:
+            loss = (v_pred - (Zhat1_b - Z0_b)).pow(2).sum(dim=-1).mean()
 
         optimizer.zero_grad()
         loss.backward()
