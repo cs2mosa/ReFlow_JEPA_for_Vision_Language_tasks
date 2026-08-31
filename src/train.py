@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 
 from reflow_jepa import ReflowJEPA
 from synthetic_data import SyntheticCaptioningDataset, collate_images_captions
+from real_captioning_data import FlickrCaptioningDataset
 
 
 def parse_args():
@@ -99,7 +100,20 @@ def parse_args():
     p.add_argument("--k-query", type=int, default=8)
     p.add_argument("--k-prefix", type=int, default=8)
     p.add_argument("--image-size", type=int, default=224)
-    p.add_argument("--dataset-length", type=int, default=50000)
+    p.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "flickr30k"],
+                    help="'synthetic' (default): the procedural shape/color dataset used "
+                         "throughout this project so far, exact one-to-one image->caption "
+                         "mapping. 'flickr30k': nlphuji/flickr30k (~31k real photos, 5 human "
+                         "captions each) -- requires internet access (Kaggle Internet toggle "
+                         "on); the point where genuine multimodal ambiguity (multiple valid "
+                         "captions per image) becomes testable, unlike the synthetic set's "
+                         "exact mapping.")
+    p.add_argument("--flickr-karpathy-split", type=str, default=None,
+                    help="optional filter on flickr30k's own internal train/val/test 'split' "
+                         "column (Karpathy partition). None (default): use every row.")
+    p.add_argument("--dataset-length", type=int, default=50000,
+                    help="only used when --dataset synthetic; flickr30k's length is fixed by "
+                         "the real dataset (~31k images)")
     p.add_argument("--real-checkpoints", action="store_true",
                     help="use real I-JEPA/T5 checkpoints instead of config-matched random weights "
                          "(needs internet access, e.g. Kaggle with the Internet toggle on)")
@@ -220,13 +234,23 @@ def main():
     n_trainable = sum(p.numel() for p in model.trainable_parameters())
     print(f"[train] trainable params: {n_trainable / 1e6:.1f}M")
 
-    dataset = SyntheticCaptioningDataset(length=args.dataset_length, image_size=args.image_size)
+    if args.dataset == "flickr30k":
+        print("[train] loading nlphuji/flickr30k (requires internet access -- if this "
+              "hangs or fails, confirm Kaggle's Internet toggle is on)")
+        dataset = FlickrCaptioningDataset(karpathy_split_filter=args.flickr_karpathy_split,
+                                           image_size=args.image_size, seed=args.seed)
+        eval_dataset = FlickrCaptioningDataset(karpathy_split_filter=args.flickr_karpathy_split,
+                                                image_size=args.image_size, seed=999)
+    else:
+        dataset = SyntheticCaptioningDataset(length=args.dataset_length, image_size=args.image_size)
+        eval_dataset = SyntheticCaptioningDataset(length=512, seed=999, image_size=args.image_size)
+
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
         collate_fn=collate_images_captions, drop_last=True,
     )
     eval_loader = DataLoader(
-        SyntheticCaptioningDataset(length=512, seed=999, image_size=args.image_size),
+        eval_dataset,
         batch_size=args.batch_size, shuffle=True, collate_fn=collate_images_captions,
     )
 
