@@ -61,6 +61,9 @@ def main():
     p.add_argument("--edm-precondition", type=lambda x: x.lower() != "false", default=True,
                     help="must match whatever the loaded checkpoint was trained with -- "
                          "see train.py --help for what this changes")
+    p.add_argument("--ema-cfm-target", type=lambda x: x.lower() != "false", default=False,
+                    help="must match whatever the loaded checkpoint was trained with -- "
+                         "see train.py --help for what this changes")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--max-new-tokens", type=int, default=16, help="must match the mock "
                     "tokenizer's max_len (16) for exact-match comparison to align")
@@ -76,6 +79,7 @@ def main():
         visual_layers=args.visual_layers, text_layers=args.text_layers,
         real_checkpoints=args.real_checkpoints,
         edm_precondition=args.edm_precondition,
+        ema_cfm_target=args.ema_cfm_target,
     ).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
@@ -85,7 +89,7 @@ def main():
               f"a mismatch here means you're testing the wrong file)")
         saved_args = checkpoint.get("args", {})
         for key in ("predictor_depth", "predictor_heads", "visual_layers", "text_layers",
-                    "real_checkpoints", "edm_precondition"):
+                    "real_checkpoints", "edm_precondition", "ema_cfm_target"):
             if key in saved_args and saved_args[key] != vars(args).get(key):
                 print(f"[checkpoint] WARNING: saved {key}={saved_args[key]} but this "
                       f"script is using {key}={vars(args).get(key)} -- architecture mismatch "

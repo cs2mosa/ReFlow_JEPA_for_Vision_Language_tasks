@@ -113,6 +113,9 @@ def main():
     p.add_argument("--edm-precondition", type=lambda x: x.lower() != "false", default=True,
                     help="must match whatever the loaded checkpoint was trained with -- "
                          "see train.py --help for what this changes")
+    p.add_argument("--ema-cfm-target", type=lambda x: x.lower() != "false", default=False,
+                    help="must match whatever the loaded checkpoint was trained with -- "
+                         "see train.py --help for what this changes")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--n-steps", type=int, default=500)
     p.add_argument("--power-iters", type=int, default=15)
@@ -125,6 +128,7 @@ def main():
         visual_layers=args.visual_layers, text_layers=args.text_layers,
         real_checkpoints=args.real_checkpoints,
         edm_precondition=args.edm_precondition,
+        ema_cfm_target=args.ema_cfm_target,
     ).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:

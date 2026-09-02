@@ -52,6 +52,9 @@ def parse_args():
     p.add_argument("--edm-precondition", type=lambda x: x.lower() != "false", default=True,
                     help="must match whatever the loaded checkpoint was trained with -- "
                          "see train.py --help for what this changes")
+    p.add_argument("--ema-cfm-target", type=lambda x: x.lower() != "false", default=False,
+                    help="must match whatever the loaded checkpoint was trained with -- "
+                         "see train.py --help for what this changes")
     p.add_argument("--sigma", type=float, default=0.02)
 
     p.add_argument("--reflow-dataset-size", type=int, default=4096,
@@ -89,6 +92,7 @@ def load_model(args, device):
         visual_layers=args.visual_layers, text_layers=args.text_layers,
         real_checkpoints=args.real_checkpoints,
         edm_precondition=args.edm_precondition,
+        ema_cfm_target=args.ema_cfm_target,
     ).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:

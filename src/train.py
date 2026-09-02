@@ -127,6 +127,17 @@ def parse_args():
                          "architecture hadn't reliably learned this on a real "
                          "checkpoint. Pass --edm-precondition false to revert to the "
                          "original architecture for comparison.")
+    p.add_argument("--ema-cfm-target", type=lambda x: x.lower() != "false", default=False,
+                    help="Use the EMA target copy of g_T (already built for retrieval-"
+                         "eval, see encode_text_target) as cfm_loss's regression target "
+                         "instead of a detached snapshot of the constantly-shifting "
+                         "online g_T. Added after a real decoder_lr_mult sweep on "
+                         "Flickr30k (0.1 vs 0.02 vs frozen) suggested predictor "
+                         "convergence was sensitive to how much recon_loss's gradient "
+                         "moves g_T per step -- this targets that mechanism directly "
+                         "rather than relying on a decoder_lr_mult value that happens "
+                         "to reduce it as a side effect. Default False preserves "
+                         "existing behavior exactly.")
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--eval-batches", type=int, default=4)
     p.add_argument("--log-path", type=str, default="training_log.json")
@@ -179,6 +190,7 @@ def build_model(args, device):
         ema_momentum=args.ema_momentum,
         real_checkpoints=args.real_checkpoints,
         edm_precondition=args.edm_precondition,
+        ema_cfm_target=args.ema_cfm_target,
         freeze_text_encoder=args.freeze_text_encoder,
         stop_grad_cfm_target=args.stop_grad_cfm_target,
     ).to(device)

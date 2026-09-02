@@ -74,12 +74,14 @@ class ReflowJEPA(nn.Module):
         freeze_text_encoder: bool = True,
         stop_grad_cfm_target: bool = True,
         edm_precondition: bool = True,
+        ema_cfm_target: bool = False,
     ):
         super().__init__()
         self.sigma = sigma
         self.ema_momentum = ema_momentum
         self.freeze_text_encoder = freeze_text_encoder
         self.stop_grad_cfm_target = stop_grad_cfm_target
+        self.ema_cfm_target = ema_cfm_target
 
         # Frozen visual encoder E_V. image_mean/image_std normalize raw [0,1] images
         # before the encoder sees them -- see load_visual_encoder's docstring: this is
@@ -237,9 +239,15 @@ class ReflowJEPA(nn.Module):
     @torch.no_grad()
     def encode_text_target(self, captions) -> torch.Tensor:
         """EMA/target-copy encoding, used for building the caption bank (retrieval-eval
-        metrics) -- NOT part of the CFM training loss itself (DESIGN.md's data flow
-        routes Z_1 through the ONLINE text pipeline; the target copy tracks it via EMA
-        for stability, mirroring I-JEPA/BYOL/DINO precedent)."""
+        metrics). DESIGN.md's original data flow routed Z_1 through the ONLINE text
+        pipeline only, with this target copy meant purely for eval-time retrieval
+        stability (I-JEPA/BYOL/DINO precedent). If self.ema_cfm_target is True, this
+        same target pipeline is ALSO used to build cfm_loss's regression target in
+        training_step -- a deliberate, later revision of that original routing, made
+        after a real decoder_lr_mult sweep on Flickr30k suggested the predictor's
+        regression target being a snapshot of the constantly-shifting online g_T was
+        part of what was destabilizing predictor convergence. See training_step's
+        Z1_for_cfm computation for the full rationale."""
         batch = self._tokenize(captions)
         return self._project_text(batch, self.text_encoder_target, self.g_t_target)
 
@@ -309,7 +317,31 @@ class ReflowJEPA(nn.Module):
         # Z1 here means only recon_loss and vicreg_t shape the text representation;
         # cfm_loss trains the predictor to hit wherever that representation currently
         # is, without being able to drag it around to make its own regression easier.
-        Z1_for_cfm = z_t_tilde.detach() if self.stop_grad_cfm_target else z_t_tilde
+        #
+        # ema_cfm_target=True (optional, default False): a FURTHER refinement on top of
+        # the stop-gradient above, motivated by a real observed pattern across a
+        # decoder_lr_mult sweep on Flickr30k, not by the original design doc (DESIGN.md
+        # explicitly routed the EMA target copy to caption-bank retrieval eval only,
+        # calling out that cfm_loss uses the online pipeline -- this flag deliberately
+        # revisits that call, it is not "using an already-intended mechanism as
+        # planned"). The sweep showed decoder_lr_mult noticeably changing how well the
+        # PREDICTOR converged (measure_exposure_bias's resid_ratio: ~4.5-4.9 at
+        # decoder_lr_mult=0.1 vs ~1.05-1.13 at 0.02), despite cfm_loss having no direct
+        # gradient path to g_t_online at all under stop-gradient -- consistent with an
+        # INDIRECT mechanism: even with cfm_loss detached, the predictor's regression
+        # target snapshots g_t_online's CURRENT weights, which recon_loss keeps shifting
+        # every step (a smaller decoder_lr_mult happened to leave less of that pressure
+        # concentrated on g_t_online, i.e. a smaller mult reduced the drift as a side
+        # effect, not because that was ever a deliberate lever for it). Using the
+        # EMA-smoothed g_t_target instead gives the predictor a slowly, smoothly
+        # evolving target regardless of decoder_lr_mult, directly targeting that
+        # mechanism rather than relying on a value of decoder_lr_mult that happened to
+        # reduce it as a side effect.
+        if self.ema_cfm_target:
+            with torch.no_grad():
+                Z1_for_cfm = self._project_text(batch, self.text_encoder_target, self.g_t_target)
+        else:
+            Z1_for_cfm = z_t_tilde.detach() if self.stop_grad_cfm_target else z_t_tilde
 
         Z0 = draw_stochastic_source(z_v_for_source, self.sigma)
         tau = torch.rand(B, device=images.device)
@@ -381,7 +413,11 @@ class ReflowJEPA(nn.Module):
         visual_anchor = self.qpool.g_v[-1].weight
 
         Z0 = draw_stochastic_source(z_v_for_source, self.sigma)
-        Z1_for_cfm = z_t_tilde.detach() if self.stop_grad_cfm_target else z_t_tilde
+        if self.ema_cfm_target:
+            with torch.no_grad():
+                Z1_for_cfm = self._project_text(batch, self.text_encoder_target, self.g_t_target)
+        else:
+            Z1_for_cfm = z_t_tilde.detach() if self.stop_grad_cfm_target else z_t_tilde
         Z1 = z_t_tilde
         tau = torch.rand(B, device=images.device)
         Z_tau = (1 - tau).unsqueeze(-1) * Z0 + tau.unsqueeze(-1) * Z1_for_cfm
