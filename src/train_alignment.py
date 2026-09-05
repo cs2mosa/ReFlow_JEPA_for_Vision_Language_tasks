@@ -349,7 +349,14 @@ def train_alignment(args) -> list[dict]:
         A_v = h_v(z_v_tilde.detach())
         A_t = h_t(z_t_tilde.detach())
 
-        align_term = alignment_loss(A_v, A_t, args.sinkhorn_epsilon, args.sinkhorn_iters)
+        # warn_on_convergence=False: run_phase_a_diagnostics (below, every --eval-every
+        # steps) already computes and reports sinkhorn_row_err/col_err/has_nan_or_inf
+        # cleanly and periodically -- the per-training-step warning fired on every
+        # single step here duplicates that same information in a far noisier form
+        # (one warning line per step, every step, for the whole run). Convergence
+        # quality is still fully monitored, just through the eval diagnostic instead.
+        align_term = alignment_loss(A_v, A_t, args.sinkhorn_epsilon, args.sinkhorn_iters,
+                                     warn_on_convergence=False)
         vicreg_term = vicreg_variance_penalty(A_v, args.vicreg_gamma) + \
             vicreg_variance_penalty(A_t, args.vicreg_gamma)
         total_loss = align_term + args.vicreg_weight * vicreg_term
