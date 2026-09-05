@@ -379,8 +379,27 @@ def train_alignment(args) -> list[dict]:
             eval_diag = run_phase_a_diagnostics(
                 model, h_v, h_t, eval_images, eval_captions,
                 args.sinkhorn_epsilon, args.sinkhorn_iters, args.vicreg_gamma,
-                hard_neg_ij=hard_neg_ij,
+                hard_neg_ij=None,  # see below -- hard-negative distance is computed
+                                    # separately, from the FIXED diagnostic batch,
+                                    # not this freshly-resampled one
             )
+            # BUG FIX: eval_images/eval_captions above are a FRESH random draw every
+            # eval step (eval_loader has shuffle=True) -- passing hard_neg_ij's
+            # indices (i, j), found once on the FIXED diag_images/diag_captions batch,
+            # into a DIFFERENT batch each time silently measured the distance between
+            # whatever random pair happened to land at positions (i, j) in that
+            # step's shuffled batch, not the same tracked pair. This made the
+            # "tracked" hard-negative distance meaningless noise from step 1 onward
+            # (confirmed: it showed no trend across a full 3000-step run, oscillating
+            # 0.47-1.52 around a flat mean -- an artifact of this bug, not evidence
+            # the alignment mechanism fails at its goal). Fix: re-project the SAME
+            # cached z_v_diag/z_t_diag (fixed images/captions, base model frozen so
+            # these never change) through the CURRENT h_v/h_t every eval instead.
+            with torch.no_grad():
+                A_v_diag = h_v(z_v_diag)
+                A_t_diag = h_t(z_t_diag)
+            i, j = hard_neg_ij
+            eval_diag["hard_negative_alignment_distance"] = alignment_space_distance(A_v_diag, A_t_diag, i, j)
             record.update({f"eval_{k}": v for k, v in eval_diag.items()})
             print(f"[step {step:5d}] total={record['total_loss']:.4f} "
                   f"align={record['alignment_loss']:.4f} vicreg={record['vicreg_term']:.4f} "
