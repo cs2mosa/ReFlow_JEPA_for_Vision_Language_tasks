@@ -26,8 +26,11 @@ Usage:
         --real-checkpoints --dataset flickr30k
 """
 import argparse
+import os
 
+import numpy as np
 import torch
+from PIL import Image
 
 from train_alignment import (
     load_frozen_base_model,
@@ -36,6 +39,15 @@ from train_alignment import (
     retrieval_accuracy,
     build_dataloaders,
 )
+
+
+def save_image_tensor(tensor: torch.Tensor, path: str) -> None:
+    """tensor: (3, H, W), [0,1] float (synthetic_data.py/real_captioning_data.py's
+    shared raw-pixel convention). Saved untouched -- model.encode_visual() rebinds a
+    local variable when it normalizes internally, it never mutates the caller's
+    tensor, so this is exactly what the model actually saw before normalization."""
+    arr = (tensor.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8).transpose(1, 2, 0)
+    Image.fromarray(arr).save(path)
 
 
 def main():
@@ -63,6 +75,12 @@ def main():
     p.add_argument("--n-batches", type=int, default=5,
                     help="check across several fresh batches, not just one -- a single "
                          "batch's 'hardest pair' could itself be a fluke")
+    p.add_argument("--output-dir", type=str, default="/kaggle/working/hard_pairs",
+                    help="where to save the hardest-pair images + captions for each "
+                         "batch, so you can directly judge whether each confusion is a "
+                         "genuinely hard (near-duplicate content) case or a genuinely "
+                         "wrong (semantically unrelated) one -- a distance number alone "
+                         "can't tell you which.")
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
@@ -79,6 +97,7 @@ def main():
 
     _, eval_loader = build_dataloaders(args)
     eval_iter = iter(eval_loader)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"\n{'batch':>6} {'hardest_pair_dist':>18} {'offdiag_mean':>13} {'offdiag_std':>12} "
           f"{'z_score':>9} {'diag_mean':>10} {'top1':>6} {'top5':>6}")
@@ -113,6 +132,29 @@ def main():
 
         print(f"{b:>6} {hardest_dist:>18.4f} {offdiag_mean:>13.4f} {offdiag_std:>12.4f} "
               f"{z_score:>9.2f} {diag_mean:>10.4f} {top1:>6.3f} {top5:>6.3f}")
+
+        # Save both images + both true captions involved in this batch's hardest
+        # confusion, so you can directly judge: does image i actually resemble image
+        # j (a genuinely hard, near-duplicate case -- not a design failure), or are
+        # they visually/semantically unrelated (a real gap the loss isn't fixing)?
+        # image i is being confused with caption j (captions[j], NOT its own true
+        # caption captions[i]) -- that's the actual wrong association z_score flags.
+        save_image_tensor(images[i], f"{args.output_dir}/batch{b}_image_i{i}.png")
+        save_image_tensor(images[j], f"{args.output_dir}/batch{b}_image_j{j}.png")
+        with open(f"{args.output_dir}/batch{b}_captions.txt", "w") as f:
+            f.write(f"image_i (index {i})'s TRUE caption:\n  {captions[i]}\n\n")
+            f.write(f"image_j (index {j})'s TRUE caption:\n  {captions[j]}\n\n")
+            f.write(f"THE CONFUSION: image_i's embedding is closer to caption_j (above) "
+                    f"than to its own true caption_i -- i.e. the model currently thinks "
+                    f"image_i looks more like a match for image_j's caption than for its "
+                    f"own.\n\n")
+            f.write(f"confused-pair distance={hardest_dist:.4f}  "
+                    f"(vs. typical correct-pair distance={diag_mean:.4f}, "
+                    f"typical wrong-pair distance={offdiag_mean:.4f})\n")
+        print(f"         -> saved batch{b}_image_i{i}.png, batch{b}_image_j{j}.png, "
+              f"batch{b}_captions.txt to {args.output_dir}")
+        print(f"         image_i true caption:  {captions[i]}")
+        print(f"         image_j true caption:  {captions[j]}  <- image_i is wrongly closest to THIS")
 
     print()
     mean_z = sum(all_z_scores) / len(all_z_scores)
