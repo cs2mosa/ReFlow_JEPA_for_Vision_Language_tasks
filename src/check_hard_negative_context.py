@@ -35,6 +35,7 @@ from PIL import Image
 from train_alignment import (
     load_frozen_base_model,
     load_alignment_checkpoint,
+    apply_finetuned_base_overrides,
     find_hard_negative_pair,
     retrieval_accuracy,
     build_dataloaders,
@@ -92,6 +93,11 @@ def main():
         args.alignment_checkpoint_path, d_in=768, device=device)
     align_dim = align_ckpt.get("align_dim", 256)
     print(f"[alignment checkpoint] step={align_step} align_dim={align_dim}")
+    # If Phase A+ finetuning (finetune_base_lr_mult > 0) was used for this alignment
+    # checkpoint, qpool/g_t_online genuinely differ from the original base checkpoint
+    # -- apply the override so this check reflects the model that was ACTUALLY
+    # trained, not a stale pre-finetuning snapshot. A no-op if finetuning wasn't used.
+    apply_finetuned_base_overrides(model, align_ckpt)
     h_v.eval()
     h_t.eval()
 

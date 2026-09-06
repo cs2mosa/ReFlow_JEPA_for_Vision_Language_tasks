@@ -28,6 +28,7 @@ end-to-end locally" step before ever touching Kaggle):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import time
 
@@ -92,6 +93,23 @@ def parse_args():
     p.add_argument("--vicreg-gamma", type=float, default=0.02,
                     help="VICReg target per-dimension std (gamma_0), same semantics as "
                          "train.py's --vicreg-gamma")
+    p.add_argument("--finetune-base-lr-mult", type=float, default=0.0,
+                    help="Phase A+ extension (opt-in, default 0.0 = fully frozen, "
+                         "identical to original spec sec 3 behavior). When > 0, allows "
+                         "a light amount of gradient into qpool and g_t_online "
+                         "specifically (nothing else -- predictor, decoder, and the "
+                         "frozen I-JEPA/T5 encoders stay untouched), at "
+                         "lr=--lr*this_value. Motivated by a real finding: a hard "
+                         "negative pair inspected visually showed no caption-level "
+                         "connection, but did share a coarse visual/structural pattern "
+                         "(a small cluster of standing figures) -- consistent with "
+                         "Q-Pool's FROZEN pooling not preserving enough signal for the "
+                         "alignment heads to separate, no matter how they're tuned. "
+                         "Mirrors decoder_lr_mult's own earlier finding: a small "
+                         "nonzero value (0.02) balanced far better than either "
+                         "extreme (0 or 0.1) -- start conservative here for the same "
+                         "reason, and because qpool/g_t_online ALSO serve the base "
+                         "model's flow-matching quality, not just this alignment task.")
 
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch-size", type=int, default=64)
@@ -150,24 +168,73 @@ def load_frozen_base_model(args, device) -> ReflowJEPA:
 
     model.eval()
     model.requires_grad_(False)  # frozen feature source, spec sec 3 -- entire phase
+    if getattr(args, "finetune_base_lr_mult", 0.0) > 0:
+        # Phase A+ extension (opt-in): selectively unfreeze ONLY qpool and
+        # g_t_online -- the two modules that actually produce z_v_tilde/z_t_tilde.
+        # Everything else (frozen I-JEPA/T5 encoders, predictor, decoder,
+        # prefix_expand) stays exactly as frozen as the default path. .train() only
+        # on these two submodules -- model.eval() above already put everything else
+        # (correctly) in eval mode, and .train()/.eval() are recursive on the CALLED
+        # module and its children only, so this doesn't disturb the rest.
+        model.qpool.requires_grad_(True)
+        model.qpool.train()
+        model.g_t_online.requires_grad_(True)
+        model.g_t_online.train()
+        print(f"[base checkpoint] Phase A+ finetuning active: qpool/g_t_online "
+              f"unfrozen at lr={args.lr * args.finetune_base_lr_mult:.2e} "
+              f"(--lr * --finetune-base-lr-mult)")
     return model
 
 
 # ---------------------------------------------------------------------------
 # Checkpointing (Phase A's own -- h_v/h_t only, distinct file from the base model's)
 # ---------------------------------------------------------------------------
-def save_alignment_checkpoint(h_v, h_t, args, step, path):
+def save_alignment_checkpoint(h_v, h_t, args, step, path, model=None):
     """Same step-count + args-metadata pattern as train.py's save_checkpoint, plus
     the specific architectural flag that changes what this checkpoint's tensors MEAN
     (align_dim -- analogous to edm_precondition/ema_cfm_target's treatment in
-    reflow_jepa.py, per spec sec 2's checkpoint-metadata-versioning lesson)."""
-    torch.save({
+    reflow_jepa.py, per spec sec 2's checkpoint-metadata-versioning lesson).
+
+    If finetune_base_lr_mult > 0 was used (Phase A+ extension), qpool/g_t_online's
+    weights now genuinely DIFFER from the original --base-checkpoint-path file --
+    saving their state here too (small: just these two submodules, not the full
+    model) keeps this checkpoint self-contained, so a later load doesn't silently
+    fall back to the STALE, pre-finetuning qpool/g_t_online from the original base
+    checkpoint. When fine-tuning wasn't used, these are identical to the base
+    checkpoint's own weights, so nothing extra is saved (no wasted disk space)."""
+    ckpt = {
         "step": step,
         "h_v_state_dict": h_v.state_dict(),
         "h_t_state_dict": h_t.state_dict(),
         "align_dim": args.align_dim if hasattr(args, "align_dim") else h_v.net[-1].out_features,
         "args": vars(args) if not isinstance(args, dict) else args,
-    }, path)
+    }
+    finetune_mult = args.get("finetune_base_lr_mult", 0.0) if isinstance(args, dict) \
+        else getattr(args, "finetune_base_lr_mult", 0.0)
+    if model is not None and finetune_mult > 0:
+        ckpt["qpool_state_dict"] = model.qpool.state_dict()
+        ckpt["g_t_online_state_dict"] = model.g_t_online.state_dict()
+    torch.save(ckpt, path)
+
+
+def apply_finetuned_base_overrides(model, align_ckpt) -> bool:
+    """If the alignment checkpoint carries fine-tuned qpool/g_t_online weights
+    (saved by save_alignment_checkpoint above, only when finetune_base_lr_mult > 0
+    was used), load them onto the given (already-loaded-from-the-original-base-
+    checkpoint) model. Returns True if an override was applied, False if this
+    alignment checkpoint didn't use fine-tuning (nothing to apply -- the original
+    base checkpoint's qpool/g_t_online are already correct as-is)."""
+    applied = False
+    if "qpool_state_dict" in align_ckpt:
+        model.qpool.load_state_dict(align_ckpt["qpool_state_dict"])
+        applied = True
+    if "g_t_online_state_dict" in align_ckpt:
+        model.g_t_online.load_state_dict(align_ckpt["g_t_online_state_dict"])
+        applied = True
+    if applied:
+        print("[alignment checkpoint] applied fine-tuned qpool/g_t_online overrides "
+              "on top of the base checkpoint (Phase A+ finetuning was used for this run)")
+    return applied
 
 
 def load_alignment_checkpoint(path, d_in=768, device="cpu"):
@@ -311,7 +378,14 @@ def train_alignment(args) -> list[dict]:
 
     h_v = AlignmentHead(d_in=d_shared, d_align=args.align_dim).to(device)
     h_t = AlignmentHead(d_in=d_shared, d_align=args.align_dim).to(device)
-    optimizer = torch.optim.AdamW(list(h_v.parameters()) + list(h_t.parameters()), lr=args.lr)
+    param_groups = [{"params": list(h_v.parameters()) + list(h_t.parameters()), "lr": args.lr}]
+    if args.finetune_base_lr_mult > 0:
+        # Phase A+ extension: qpool/g_t_online were unfrozen in load_frozen_base_model
+        # above -- add them as a SEPARATE, much lower-LR param group, same pattern as
+        # train.py's decoder_lr_mult (a single shared optimizer, distinct per-group LR).
+        finetune_params = list(model.qpool.parameters()) + list(model.g_t_online.parameters())
+        param_groups.append({"params": finetune_params, "lr": args.lr * args.finetune_base_lr_mult})
+    optimizer = torch.optim.AdamW(param_groups)
 
     loader, eval_loader = build_dataloaders(args)
     data_iter = iter(loader)
@@ -339,15 +413,22 @@ def train_alignment(args) -> list[dict]:
         images = images.to(device)
         B = images.shape[0]
 
-        with torch.no_grad():
+        with torch.no_grad() if args.finetune_base_lr_mult == 0 else contextlib.nullcontext():
             c = model.task_token.expand(B, -1)
             z_v_tilde = model.encode_visual(images, c)
             z_t_tilde = model.encode_text_online(captions)
-        # spec sec 4.1: inputs are detached copies -- already no_grad above (base
-        # model is entirely frozen), .detach() here too so h_v/h_t's graph never
-        # reaches back into the no_grad block's tensors by accident of aliasing.
-        A_v = h_v(z_v_tilde.detach())
-        A_t = h_t(z_t_tilde.detach())
+        # spec sec 4.1: inputs are detached copies when the base model is fully
+        # frozen (finetune_base_lr_mult == 0, the default) -- already no_grad above
+        # in that case, .detach() too so h_v/h_t's graph never reaches back into the
+        # no_grad block's tensors by accident of aliasing. When finetune_base_lr_mult
+        # > 0 (Phase A+), do NOT detach -- that would cut off the exact gradient path
+        # to qpool/g_t_online this mode exists to enable.
+        if args.finetune_base_lr_mult == 0:
+            A_v = h_v(z_v_tilde.detach())
+            A_t = h_t(z_t_tilde.detach())
+        else:
+            A_v = h_v(z_v_tilde)
+            A_t = h_t(z_t_tilde)
 
         # warn_on_convergence=False: run_phase_a_diagnostics (below, every --eval-every
         # steps) already computes and reports sinkhorn_row_err/col_err/has_nan_or_inf
@@ -395,9 +476,22 @@ def train_alignment(args) -> list[dict]:
             # the alignment mechanism fails at its goal). Fix: re-project the SAME
             # cached z_v_diag/z_t_diag (fixed images/captions, base model frozen so
             # these never change) through the CURRENT h_v/h_t every eval instead.
+            # Fix's own assumption ("base model frozen so these never change") no
+            # longer holds when finetune_base_lr_mult > 0 -- qpool/g_t_online DO
+            # change over training in that mode, so the cached z_v_diag/z_t_diag
+            # (computed once, at step 0's qpool/g_t_online state) would grow stale
+            # relative to the model's CURRENT weights. Recompute them fresh each eval
+            # in that mode; reuse the cheap cached versions otherwise (this is the
+            # ONLY thing that differs between the two modes here -- diag_images/
+            # diag_captions themselves, and hard_neg_ij, stay fixed either way).
             with torch.no_grad():
-                A_v_diag = h_v(z_v_diag)
-                A_t_diag = h_t(z_t_diag)
+                if args.finetune_base_lr_mult > 0:
+                    z_v_diag_current = model.encode_visual(diag_images, c_diag)
+                    z_t_diag_current = model.encode_text_online(diag_captions)
+                else:
+                    z_v_diag_current, z_t_diag_current = z_v_diag, z_t_diag
+                A_v_diag = h_v(z_v_diag_current)
+                A_t_diag = h_t(z_t_diag_current)
             i, j = hard_neg_ij
             eval_diag["hard_negative_alignment_distance"] = alignment_space_distance(A_v_diag, A_t_diag, i, j)
             record.update({f"eval_{k}": v for k, v in eval_diag.items()})
@@ -410,12 +504,12 @@ def train_alignment(args) -> list[dict]:
         step += 1
 
         if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
-            save_alignment_checkpoint(h_v, h_t, args, step, args.checkpoint_path)
+            save_alignment_checkpoint(h_v, h_t, args, step, args.checkpoint_path, model=model)
             print(f"[train_alignment] checkpoint saved at step {step} -> {args.checkpoint_path}")
 
     with open(args.log_path, "w") as f:
         json.dump(log, f)
-    save_alignment_checkpoint(h_v, h_t, args, step, args.checkpoint_path)
+    save_alignment_checkpoint(h_v, h_t, args, step, args.checkpoint_path, model=model)
     print(f"[train_alignment] done. log -> {args.log_path}, checkpoint -> {args.checkpoint_path} (step {step})")
     return log
 
