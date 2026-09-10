@@ -56,6 +56,8 @@ def parse_args():
                     help="must match whatever the loaded checkpoint was trained with -- "
                          "see train.py --help for what this changes")
     p.add_argument("--sigma", type=float, default=0.02)
+    p.add_argument("--visual-encoder", type=str, default="ijepa", choices=["ijepa", "siglip"],
+                    help="must match whatever the loaded checkpoint was trained with")
 
     p.add_argument("--reflow-dataset-size", type=int, default=4096,
                     help="number of (Z0, Z_hat_1) pairs to simulate offline before "
@@ -83,7 +85,10 @@ def parse_args():
     p.add_argument("--log-path", type=str, default="reflow_round_log.json")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
-    return p.parse_args()
+    args = p.parse_args()
+    from encoders import VISUAL_ENCODER_SPECS
+    args.image_size = VISUAL_ENCODER_SPECS[args.visual_encoder][2]
+    return args
 
 
 def load_model(args, device):
@@ -93,6 +98,7 @@ def load_model(args, device):
         real_checkpoints=args.real_checkpoints,
         edm_precondition=args.edm_precondition,
         ema_cfm_target=args.ema_cfm_target,
+        visual_encoder=args.visual_encoder,
     ).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:

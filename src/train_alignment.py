@@ -79,6 +79,8 @@ def parse_args():
                     help="must match whatever the loaded checkpoint was trained with")
     p.add_argument("--ema-momentum", type=float, default=0.996,
                     help="must match whatever the loaded checkpoint was trained with")
+    p.add_argument("--visual-encoder", type=str, default="ijepa", choices=["ijepa", "siglip"],
+                    help="must match whatever the loaded checkpoint was trained with")
 
     # Phase A hyperparameters (spec sec 5 point 5)
     p.add_argument("--align-dim", type=int, default=256,
@@ -124,11 +126,17 @@ def parse_args():
     p.add_argument("--flickr-karpathy-split", type=str, default=None)
     p.add_argument("--dataset-length", type=int, default=50000,
                     help="only used when --dataset synthetic")
-    p.add_argument("--image-size", type=int, default=224)
+    p.add_argument("--image-size", type=int, default=None,
+                    help="default (None): auto-derived from --visual-encoder (224 for "
+                         "ijepa, 384 for siglip). Pass explicitly only to override.")
 
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.image_size is None:
+        from encoders import VISUAL_ENCODER_SPECS
+        args.image_size = VISUAL_ENCODER_SPECS[args.visual_encoder][2]
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +159,7 @@ def load_frozen_base_model(args, device) -> ReflowJEPA:
         ema_cfm_target=args.ema_cfm_target,
         freeze_text_encoder=args.freeze_text_encoder,
         stop_grad_cfm_target=args.stop_grad_cfm_target,
+        visual_encoder=getattr(args, "visual_encoder", "ijepa"),
     ).to(device)
 
     checkpoint = torch.load(args.base_checkpoint_path, map_location=device)

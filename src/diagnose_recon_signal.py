@@ -70,8 +70,13 @@ def main():
     p.add_argument("--integrate-steps", type=int, default=50,
                     help="Euler steps for the flow's own integrate() call in Check 3 "
                          "(the actual inference-time path, not a diagnostic shortcut)")
+    p.add_argument("--visual-encoder", type=str, default="ijepa", choices=["ijepa", "siglip"],
+                    help="must match whatever the loaded checkpoint was trained with")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
+
+    from encoders import VISUAL_ENCODER_SPECS
+    image_size = VISUAL_ENCODER_SPECS[args.visual_encoder][2]
 
     device = torch.device(args.device)
     model = ReflowJEPA(
@@ -80,6 +85,7 @@ def main():
         real_checkpoints=args.real_checkpoints,
         edm_precondition=args.edm_precondition,
         ema_cfm_target=args.ema_cfm_target,
+        visual_encoder=args.visual_encoder,
     ).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
@@ -89,7 +95,7 @@ def main():
               f"a mismatch here means you're testing the wrong file)")
         saved_args = checkpoint.get("args", {})
         for key in ("predictor_depth", "predictor_heads", "visual_layers", "text_layers",
-                    "real_checkpoints", "edm_precondition", "ema_cfm_target"):
+                    "real_checkpoints", "edm_precondition", "ema_cfm_target", "visual_encoder"):
             if key in saved_args and saved_args[key] != vars(args).get(key):
                 print(f"[checkpoint] WARNING: saved {key}={saved_args[key]} but this "
                       f"script is using {key}={vars(args).get(key)} -- architecture mismatch "
@@ -107,7 +113,7 @@ def main():
         model.load_state_dict(checkpoint, strict=False)
     model.eval()
 
-    ds = SyntheticCaptioningDataset(length=args.batch_size, seed=4321)
+    ds = SyntheticCaptioningDataset(length=args.batch_size, seed=4321, image_size=image_size)
     dl = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate_images_captions)
     images, captions = next(iter(dl))
     images = images.to(device)

@@ -68,10 +68,13 @@ def main():
     p.add_argument("--stop-grad-cfm-target", type=lambda x: x.lower() != "false", default=True)
     p.add_argument("--sigma", type=float, default=0.02)
     p.add_argument("--ema-momentum", type=float, default=0.996)
+    p.add_argument("--visual-encoder", type=str, default="ijepa", choices=["ijepa", "siglip"],
+                    help="must match whatever the loaded base checkpoint was trained with")
     p.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "flickr30k"])
     p.add_argument("--flickr-karpathy-split", type=str, default=None)
     p.add_argument("--dataset-length", type=int, default=50000)
-    p.add_argument("--image-size", type=int, default=224)
+    p.add_argument("--image-size", type=int, default=None,
+                    help="default (None): auto-derived from --visual-encoder.")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--n-batches", type=int, default=5,
                     help="check across several fresh batches, not just one -- a single "
@@ -85,6 +88,9 @@ def main():
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
+    if args.image_size is None:
+        from encoders import VISUAL_ENCODER_SPECS
+        args.image_size = VISUAL_ENCODER_SPECS[args.visual_encoder][2]
 
     device = torch.device(args.device)
     model = load_frozen_base_model(args, device)

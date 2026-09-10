@@ -20,23 +20,56 @@ D_SHARED = 768          # calibrated shared latent space, matches Reflow-JEPA v3
                          # Also equals T5-base's d_model, so Prefix-Expand's output
                          # needs no extra width projection before the T5 decoder.
 D_IJEPA = 1280           # ViT-H/14 hidden size (corrected dimension, Reflow-JEPA v3 §5.1)
-P_PATCHES = 256          # ViT-H/14 patch count at 224x224
+P_PATCHES_IJEPA = 256    # ViT-H/14 patch count at 224x224
+P_PATCHES = P_PATCHES_IJEPA  # back-compat alias -- tests/conftest.py and older callers
+                              # import this name directly; keep it pointing at I-JEPA's
+                              # count since that's still the class-level default encoder.
+IMAGE_SIZE_IJEPA = 224
 D_TEXT = 768             # T5-base hidden size
 K_QUERY_SLOTS = 8        # Q-Pool learned query slots (Reflow-JEPA v3 §5.2)
 K_PREFIX_TOKENS = 8      # Prefix-Expand pseudo-sequence length
 
+# SigLIP so400m/14 @ 384res (google/siglip-so400m-patch14-384): contrastively
+# pretrained image+text dual encoder, added as a selectable alternative to I-JEPA for
+# the visual tower only (see conversation notes / DESIGN.md discussion on the
+# modality-gap risk of also swapping the text tower -- that would trivialize the
+# cross-modal transport this whole project exists to validate, so it's deliberately
+# NOT done here; T5 stays the text side regardless of visual_encoder choice).
+# num_patches = (image_size // patch_size) ** 2 = (384 // 14) ** 2 = 27**2 = 729,
+# confirmed against transformers' own SiglipVisionEmbeddings source (integer floor
+# division, not 384/14 exactly) -- verified, not assumed, since getting this wrong
+# silently mismatches the position-embedding table's size at real-checkpoint load time.
+D_SIGLIP = 1152          # so400m hidden size
+P_PATCHES_SIGLIP = 729   # (384 // 14) ** 2, no CLS token (same convention as I-JEPA)
+IMAGE_SIZE_SIGLIP = 384
 
-def load_visual_encoder(num_layers: int = 2, real_checkpoint: bool = False):
+# encoder name -> (d_v, p_patches, image_size), the three things that must all move
+# together when the visual encoder is swapped. Single source of truth for both
+# load_visual_encoder (below) and ReflowJEPA.__init__ (reflow_jepa.py), so the two
+# can never disagree about which encoder implies which shapes.
+VISUAL_ENCODER_SPECS = {
+    "ijepa": (D_IJEPA, P_PATCHES_IJEPA, IMAGE_SIZE_IJEPA),
+    "siglip": (D_SIGLIP, P_PATCHES_SIGLIP, IMAGE_SIZE_SIGLIP),
+}
+
+
+def load_visual_encoder(num_layers: int = 2, real_checkpoint: bool = False, encoder: str = "ijepa"):
     """
-    Real I-JEPA is ViT-H/14, patch_size=14, image_size=224, hidden_size=1280.
+    encoder="ijepa" (default, preserves all existing behavior): real I-JEPA is
+    ViT-H/14, patch_size=14, image_size=224, hidden_size=1280.
+    encoder="siglip": google/siglip-so400m-patch14-384, patch_size=14, image_size=384,
+    hidden_size=1152 -- a contrastively (not self-supervised) pretrained vision tower,
+    added as an alternative starting geometry for z_v_tilde. T5 remains the text side
+    in both cases; only the visual tower changes.
+
     `num_layers` only affects wall-clock time in the mock-weight path; it does not
     affect any shape/scale/statistics assumption downstream, which only depends on
     hidden_size and patch_size.
 
     real_checkpoint=True switches to .from_pretrained (requires internet + hub access,
     e.g. on Kaggle with the Internet toggle on). Verified current as of this writing:
-    "facebook/ijepa_vith14_1k" is a real, presently-hosted checkpoint (HF transformers
-    docs' own I-JEPA usage example uses this exact identifier).
+    "facebook/ijepa_vith14_1k" and "google/siglip-so400m-patch14-384" are both real,
+    presently-hosted checkpoints.
 
     Returns (model, image_mean, image_std) -- NOT just the model. The mean/std are
     (1,3,1,1)-shaped tensors for normalizing raw [0,1] images before the encoder sees
@@ -44,33 +77,57 @@ def load_visual_encoder(num_layers: int = 2, real_checkpoint: bool = False):
     (synthetic_data.py's render_shape) are raw [0,1] pixel tensors with NO
     normalization applied anywhere in the pipeline. That's harmless for the mock path
     (random weights have no expectation about input distribution), but feeding
-    un-normalized images directly into REAL pretrained I-JEPA weights would produce
-    garbage features -- the encoder was never trained on inputs in that distribution.
-    For real_checkpoint=True, the returned mean/std come from
+    un-normalized images directly into REAL pretrained weights would produce garbage
+    features -- the encoder was never trained on inputs in that distribution. For
+    real_checkpoint=True, the returned mean/std come from
     AutoImageProcessor.from_pretrained (the officially documented preprocessing for
-    this checkpoint), not hand-guessed constants. For the mock path, mean=0/std=1
-    (identity, a no-op) so nothing changes for any existing mock-path test.
+    this checkpoint), not hand-guessed constants, for EITHER encoder. For the mock
+    path, mean=0/std=1 (identity, a no-op) so nothing changes for any existing
+    mock-path test.
     """
+    if encoder not in VISUAL_ENCODER_SPECS:
+        raise ValueError(f"Unknown encoder {encoder!r}, expected one of {list(VISUAL_ENCODER_SPECS)}")
+    d_v, p_patches, image_size = VISUAL_ENCODER_SPECS[encoder]
+
     if real_checkpoint:
-        from transformers import AutoImageProcessor, IJepaModel
-        # NOT ViTModel: real I-JEPA has no CLS token and no pooler (confirmed directly
-        # by a real error from an earlier attempt using ViTModel.from_pretrained here --
-        # it reported missing pooler.dense.*/embeddings.cls_token and a position-
-        # embeddings shape of [1,256,1280] vs ViTModel's expected [1,257,1280], i.e.
-        # exactly "256 patches, no CLS token prepended." transformers ships a dedicated
-        # IJepaModel/IJepaConfig class for exactly this architecture difference.
-        # _extract_patch_tokens() below already handles both cases (256 or 257 tokens)
-        # so no other code needs to change once this loads with the right class.
-        model = IJepaModel.from_pretrained("facebook/ijepa_vith14_1k")
-        processor = AutoImageProcessor.from_pretrained("facebook/ijepa_vith14_1k")
+        from transformers import AutoImageProcessor
+        if encoder == "ijepa":
+            from transformers import IJepaModel
+            # NOT ViTModel: real I-JEPA has no CLS token and no pooler (confirmed
+            # directly by a real error from an earlier attempt using
+            # ViTModel.from_pretrained here -- it reported missing
+            # pooler.dense.*/embeddings.cls_token and a position-embeddings shape of
+            # [1,256,1280] vs ViTModel's expected [1,257,1280], i.e. exactly "256
+            # patches, no CLS token prepended." transformers ships a dedicated
+            # IJepaModel/IJepaConfig class for exactly this architecture difference.
+            # _extract_patch_tokens() already handles both cases (256 or 257 tokens)
+            # so no other code needs to change once this loads with the right class.
+            model = IJepaModel.from_pretrained("facebook/ijepa_vith14_1k")
+            processor = AutoImageProcessor.from_pretrained("facebook/ijepa_vith14_1k")
+        else:
+            from transformers import SiglipVisionModel
+            # SigLIP's vision tower also has no CLS token (patch_embeds are used
+            # directly, position_embedding added over exactly num_patches positions --
+            # verified against transformers' SiglipVisionEmbeddings source), so the
+            # same _extract_patch_tokens() no-CLS branch applies unchanged.
+            model = SiglipVisionModel.from_pretrained("google/siglip-so400m-patch14-384")
+            processor = AutoImageProcessor.from_pretrained("google/siglip-so400m-patch14-384")
         image_mean = torch.tensor(processor.image_mean).view(1, 3, 1, 1).float()
         image_std = torch.tensor(processor.image_std).view(1, 3, 1, 1).float()
     else:
-        cfg = ViTConfig(
-            image_size=224, patch_size=14, hidden_size=D_IJEPA,
-            num_hidden_layers=num_layers, num_attention_heads=16, intermediate_size=5120,
-        )
-        model = ViTModel(cfg)
+        if encoder == "ijepa":
+            cfg = ViTConfig(
+                image_size=image_size, patch_size=14, hidden_size=d_v,
+                num_hidden_layers=num_layers, num_attention_heads=16, intermediate_size=5120,
+            )
+            model = ViTModel(cfg)
+        else:
+            from transformers import SiglipVisionConfig, SiglipVisionModel
+            cfg = SiglipVisionConfig(
+                image_size=image_size, patch_size=14, hidden_size=d_v,
+                num_hidden_layers=num_layers, num_attention_heads=16, intermediate_size=4304,
+            )
+            model = SiglipVisionModel(cfg)
         image_mean = torch.zeros(1, 3, 1, 1)
         image_std = torch.ones(1, 3, 1, 1)
     model.eval()

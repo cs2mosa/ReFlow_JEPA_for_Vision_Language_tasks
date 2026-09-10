@@ -99,7 +99,22 @@ def parse_args():
                          "driving collapse regardless of loss weight.")
     p.add_argument("--k-query", type=int, default=8)
     p.add_argument("--k-prefix", type=int, default=8)
-    p.add_argument("--image-size", type=int, default=224)
+    p.add_argument("--visual-encoder", type=str, default="ijepa", choices=["ijepa", "siglip"],
+                    help="'ijepa' (default): I-JEPA ViT-H/14, self-supervised, no text "
+                         "ever seen during pretraining -- preserves all existing "
+                         "behavior/checkpoints exactly. 'siglip': google/siglip-so400m-"
+                         "patch14-384, contrastively pretrained on paired image-text data "
+                         "-- swaps ONLY the visual tower (T5 stays the text side either "
+                         "way, so this is testing whether a better-organized starting "
+                         "z_v geometry eases the cross-modal transport problem, not "
+                         "substituting a pre-solved one -- see conversation notes on why "
+                         "swapping the text tower too would trivialize that test).")
+    p.add_argument("--image-size", type=int, default=None,
+                    help="default (None): auto-derived from --visual-encoder (224 for "
+                         "ijepa, 384 for siglip, matching each encoder's native "
+                         "resolution/patch-count -- getting this wrong silently "
+                         "mismatches the position-embedding table's size). Pass an "
+                         "explicit value only to deliberately override.")
     p.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "flickr30k"],
                     help="'synthetic' (default): the procedural shape/color dataset used "
                          "throughout this project so far, exact one-to-one image->caption "
@@ -150,7 +165,11 @@ def parse_args():
     p.add_argument("--checkpoint-path", type=str, default="reflow_jepa_ckpt.pt")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.image_size is None:
+        from encoders import VISUAL_ENCODER_SPECS
+        args.image_size = VISUAL_ENCODER_SPECS[args.visual_encoder][2]
+    return args
 
 
 def save_checkpoint(model, args, step, path):
@@ -193,6 +212,7 @@ def build_model(args, device):
         ema_cfm_target=args.ema_cfm_target,
         freeze_text_encoder=args.freeze_text_encoder,
         stop_grad_cfm_target=args.stop_grad_cfm_target,
+        visual_encoder=args.visual_encoder,
     ).to(device)
     return model
 

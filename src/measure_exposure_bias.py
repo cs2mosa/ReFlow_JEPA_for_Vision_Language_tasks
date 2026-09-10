@@ -105,8 +105,13 @@ def main():
                          "see train.py --help for what this changes")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--n-steps", type=int, default=500)
+    p.add_argument("--visual-encoder", type=str, default="ijepa", choices=["ijepa", "siglip"],
+                    help="must match whatever the loaded checkpoint was trained with")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
+
+    from encoders import VISUAL_ENCODER_SPECS
+    image_size = VISUAL_ENCODER_SPECS[args.visual_encoder][2]
 
     device = torch.device(args.device)
     model = ReflowJEPA(
@@ -115,6 +120,7 @@ def main():
         real_checkpoints=args.real_checkpoints,
         edm_precondition=args.edm_precondition,
         ema_cfm_target=args.ema_cfm_target,
+        visual_encoder=args.visual_encoder,
     ).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
@@ -129,7 +135,7 @@ def main():
         model.load_state_dict(checkpoint, strict=False)
     model.eval()
 
-    ds = SyntheticCaptioningDataset(length=args.batch_size, seed=24680)
+    ds = SyntheticCaptioningDataset(length=args.batch_size, seed=24680, image_size=image_size)
     dl = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate_images_captions)
     images, captions = next(iter(dl))
     images = images.to(device)

@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 from encoders import (
     D_SHARED, D_IJEPA, D_TEXT, P_PATCHES, K_QUERY_SLOTS, K_PREFIX_TOKENS,
-    load_visual_encoder, load_text_seq2seq, make_ema_copy, ema_update,
+    VISUAL_ENCODER_SPECS, load_visual_encoder, load_text_seq2seq, make_ema_copy, ema_update,
 )
 from qpool import QPool
 from text_projection import TextProjectionHead
@@ -39,16 +39,20 @@ from prefix_expand import PrefixExpand
 from vicreg import vicreg_variance_penalty
 
 
-def _extract_patch_tokens(vit_last_hidden_state: torch.Tensor) -> torch.Tensor:
-    """ViT-style checkpoints prepend a CLS token; true I-JEPA does not. Mirrors
-    test_01's extraction logic so the same rule is used in training and tests."""
+def _extract_patch_tokens(vit_last_hidden_state: torch.Tensor, p_patches: int) -> torch.Tensor:
+    """ViT-style checkpoints prepend a CLS token; true I-JEPA and SigLIP's vision
+    tower do not. `p_patches` is the CALLER's expected patch count for whichever
+    visual encoder is actually loaded (previously a hardcoded module constant --
+    made explicit so this is correct regardless of which encoder ReflowJEPA was
+    built with). Mirrors test_01's extraction logic so the same rule is used in
+    training and tests."""
     n_tokens = vit_last_hidden_state.shape[1]
-    if n_tokens == P_PATCHES + 1:
+    if n_tokens == p_patches + 1:
         return vit_last_hidden_state[:, 1:, :]
-    elif n_tokens == P_PATCHES:
+    elif n_tokens == p_patches:
         return vit_last_hidden_state
     else:
-        raise AssertionError(f"Expected {P_PATCHES} or {P_PATCHES + 1} tokens, got {n_tokens}.")
+        raise AssertionError(f"Expected {p_patches} or {p_patches + 1} tokens, got {n_tokens}.")
 
 
 def _mean_pool_text(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -60,7 +64,7 @@ class ReflowJEPA(nn.Module):
     def __init__(
         self,
         d_shared: int = D_SHARED,
-        d_v: int = D_IJEPA,
+        d_v: int = None,
         d_text: int = D_TEXT,
         k_query: int = K_QUERY_SLOTS,
         k_prefix: int = K_PREFIX_TOKENS,
@@ -75,6 +79,7 @@ class ReflowJEPA(nn.Module):
         stop_grad_cfm_target: bool = True,
         edm_precondition: bool = True,
         ema_cfm_target: bool = False,
+        visual_encoder: str = "ijepa",
     ):
         super().__init__()
         self.sigma = sigma
@@ -82,13 +87,24 @@ class ReflowJEPA(nn.Module):
         self.freeze_text_encoder = freeze_text_encoder
         self.stop_grad_cfm_target = stop_grad_cfm_target
         self.ema_cfm_target = ema_cfm_target
+        self.visual_encoder_name = visual_encoder
+
+        # d_v/p_patches derive from visual_encoder unless explicitly overridden --
+        # keeps the two from ever silently disagreeing (VISUAL_ENCODER_SPECS is the
+        # single source of truth encoders.py's loader also reads from). Default
+        # visual_encoder="ijepa" preserves every existing caller's behavior exactly;
+        # pass visual_encoder="siglip" to swap only the visual tower -- d_text/T5
+        # are untouched either way.
+        spec_d_v, spec_p_patches, _ = VISUAL_ENCODER_SPECS[visual_encoder]
+        d_v = spec_d_v if d_v is None else d_v
+        self.p_patches = spec_p_patches
 
         # Frozen visual encoder E_V. image_mean/image_std normalize raw [0,1] images
         # before the encoder sees them -- see load_visual_encoder's docstring: this is
         # a no-op (mean=0, std=1) for the mock path, and the officially documented
         # AutoImageProcessor stats for the real-checkpoint path.
         self.visual_encoder, image_mean, image_std = load_visual_encoder(
-            num_layers=visual_layers, real_checkpoint=real_checkpoints)
+            num_layers=visual_layers, real_checkpoint=real_checkpoints, encoder=visual_encoder)
         self.register_buffer("image_mean", image_mean)
         self.register_buffer("image_std", image_std)
         for p in self.visual_encoder.parameters():
@@ -225,7 +241,7 @@ class ReflowJEPA(nn.Module):
     def _visual_forward(self, images: torch.Tensor) -> torch.Tensor:
         images = (images - self.image_mean) / self.image_std
         out = self.visual_encoder(images).last_hidden_state
-        return _extract_patch_tokens(out)
+        return _extract_patch_tokens(out, self.p_patches)
 
     def encode_visual(self, images: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         h_v = self._visual_forward(images)
