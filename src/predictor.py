@@ -24,6 +24,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+EDM_TAU_CLAMP_MIN = 1e-4  # single source of truth for the (1-tau) floor used both
+                           # inside VelocityPredictor.forward (edm_precondition=True)
+                           # and by every caller that needs to invert its output back
+                           # to z1_hat (see reflow_jepa.recover_z1_hat_from_velocity) --
+                           # defined here, at the origin of the clamp, and imported
+                           # everywhere else, specifically so it cannot drift out of
+                           # sync the way it silently had before this fix.
+
+
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -128,5 +137,5 @@ class VelocityPredictor(nn.Module):
             return raw
 
         z1_hat = F.normalize(z_v_tilde + raw, dim=-1)
-        denom = (1 - tau).clamp(min=1e-4).unsqueeze(-1)
+        denom = (1 - tau).clamp(min=EDM_TAU_CLAMP_MIN).unsqueeze(-1)
         return (z1_hat - z_tau) / denom
