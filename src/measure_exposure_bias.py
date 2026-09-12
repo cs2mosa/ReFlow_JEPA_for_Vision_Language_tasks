@@ -14,12 +14,29 @@ compound, the predictor is being queried at inference on inputs it never receive
 training gradient for -- a flow-matching analogue of the exposure-bias problem already
 found and fixed once for the decoder's teacher forcing.
 
-Two comparisons, both at matched tau using the identical Z0:
+Three comparisons, all at matched tau using the identical Z0:
   1. ||Z_tau|| under training-interpolation vs under real integration -- does the
      trajectory actually leave the training distribution's support.
   2. The predictor's OWN residual error, evaluated at the training point vs the
      inference point -- if the network extrapolates poorly, residual_infer >>
      residual_train even though both are being asked about the same underlying target.
+  3. NEW: for --dataset flickr30k, the SAME inference-time estimate scored against
+     ALL 5 of the image's true captions, not just the one it happened to be paired
+     with in training -- a high resid_infer against the paired caption alone can't
+     distinguish "the flow genuinely failed" from "the flow landed near a DIFFERENT
+     valid caption for this same image," which real Flickr30k images can have and
+     synthetic_data.py's exact one-to-one mapping cannot. Reported as best_of_k
+     alongside resid_infer; for --dataset synthetic, K=1 and best_of_k == resid_infer
+     exactly (a built-in sanity check that the mechanism is wired correctly).
+
+DATA-DISTRIBUTION FIX: this previously always used SyntheticCaptioningDataset, even
+when --real-checkpoints pointed at a checkpoint trained on --dataset flickr30k. That's
+a genuine confound -- a model that has only ever seen real photos, evaluated on
+procedurally-generated synthetic shapes, could show degraded/divergent behavior purely
+from being out-of-distribution on the INPUT side, with nothing to do with flow-matching
+exposure bias specifically. --dataset now defaults to synthetic (unchanged behavior for
+anyone not passing it) but should be set to flickr30k to test a real-data checkpoint on
+the data it actually trained on.
 
 BUG FIXED after the EDM-preconditioned architecture was introduced: this originally
 computed the residual as ||v_pred - (Z1-Z0)|| directly on the raw velocity output. For
@@ -34,7 +51,8 @@ which stays close to its true bounded scale (<=~4) regardless of tau.
 
 Usage:
     python measure_exposure_bias.py --checkpoint-path /kaggle/working/reflow_jepa_ckpt.pt \
-        --predictor-depth 6 --predictor-heads 8 --visual-layers 4 --text-layers 4
+        --predictor-depth 6 --predictor-heads 8 --visual-layers 4 --text-layers 4 \
+        --real-checkpoints --visual-encoder siglip --dataset flickr30k
 """
 import argparse
 
@@ -74,19 +92,53 @@ def integrate_from_z0_capturing(model, Z0, z_v_tilde, c, capture_taus, n_steps, 
 
 
 @torch.no_grad()
-def compute_residual(model, Z_point, tau_batch, z_v_tilde, c, Z1_true, Z0):
-    """Same branch as reflow_jepa.py's training_step: for edm_precondition=True,
-    recover the bounded target-estimate algebraically (z1_hat = v_pred*(1-tau) +
-    Z_point) and compare THAT to the true target -- avoids ever constructing the
-    tau-amplified raw quantity. For edm_precondition=False, unchanged: residual is
-    computed directly against the (Z1-Z0) velocity target."""
+def recover_target_estimate(model, Z_point, tau_batch, z_v_tilde, c):
+    """Recovers the network's target-estimate at Z_point, in whichever representation
+    compute_residual/residual_to_best_of_k score against Z1_true below -- the bounded
+    z1_hat (edm_precondition=True) or the raw velocity (False). Split out from the old
+    compute_residual so the SAME recovered estimate (one predictor forward pass) can be
+    scored against one target (the paired caption) or several (the multi-caption
+    best-of-k check) without calling the predictor twice per tau."""
     v_pred = model.predictor(Z_point, tau_batch, z_v_tilde, c)
     if model.predictor.edm_precondition:
-        z1_hat = v_pred * (1 - tau_batch).unsqueeze(-1) + Z_point
-        return (z1_hat - Z1_true).norm(dim=-1).mean().item()
+        return v_pred * (1 - tau_batch).unsqueeze(-1) + Z_point
+    return v_pred
+
+
+def residual_to_target(estimate, Z1_true, Z0, edm_precondition):
+    """Unchanged behavior from the original compute_residual for both branches --
+    just factored out so it can be reused for both the single-caption and
+    multi-caption comparisons below."""
+    if edm_precondition:
+        return (estimate - Z1_true).norm(dim=-1).mean().item()
+    target_direction = Z1_true - Z0
+    return (estimate - target_direction).norm(dim=-1).mean().item()
+
+
+def residual_to_best_of_k(estimate, Z1_candidates, Z0, edm_precondition):
+    """Z1_candidates: (B, K, D) -- the K true-caption candidate embeddings per example
+    (K=5 for flickr30k's 5 human captions, K=1 for synthetic -- a no-op there, see
+    module docstring). Per-example best (minimum) residual against its OWN candidate
+    set, NOT necessarily the one it was paired with in training. Also returns which
+    candidate (0..K-1) was best per example, in case that caption differing from index
+    0 (the one __getitem__ would have randomly sampled) is itself worth inspecting."""
+    if edm_precondition:
+        dists = (estimate.unsqueeze(1) - Z1_candidates).norm(dim=-1)  # (B, K)
     else:
-        target_direction = Z1_true - Z0
-        return (v_pred - target_direction).norm(dim=-1).mean().item()
+        target = Z1_candidates - Z0.unsqueeze(1)                      # (B, K, D)
+        dists = (estimate.unsqueeze(1) - target).norm(dim=-1)         # (B, K)
+    best_per_example, best_idx = dists.min(dim=1)
+    return best_per_example.mean().item(), best_idx
+
+
+@torch.no_grad()
+def encode_captions(model, captions, device):
+    """captions: flat list of strings (already B*K if scoring K candidates per
+    example -- caller reshapes the (N, D) result back to (B, K, D))."""
+    batch = model.tokenizer(captions, return_tensors="pt", padding=True)
+    batch = {k: v.to(device) for k, v in batch.items()}
+    enc_out = model.text_seq2seq.get_encoder()(**batch).last_hidden_state
+    return F.normalize(model.g_t_online(_mean_pool_text(enc_out, batch["attention_mask"])), dim=-1)
 
 
 def main():
@@ -107,6 +159,13 @@ def main():
     p.add_argument("--n-steps", type=int, default=500)
     p.add_argument("--visual-encoder", type=str, default="ijepa", choices=["ijepa", "siglip"],
                     help="must match whatever the loaded checkpoint was trained with")
+    p.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "flickr30k"],
+                    help="default 'synthetic' preserves old behavior. Set to 'flickr30k' to "
+                         "evaluate a --real-checkpoints checkpoint on the SAME kind of data it "
+                         "was actually trained on -- see module docstring's DATA-DISTRIBUTION "
+                         "FIX note for why this matters for trusting the numbers below.")
+    p.add_argument("--flickr-karpathy-split", type=str, default=None,
+                    help="optional filter on Flickr30k's train/val/test column; None uses all rows")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
@@ -135,21 +194,36 @@ def main():
         model.load_state_dict(checkpoint, strict=False)
     model.eval()
 
-    ds = SyntheticCaptioningDataset(length=args.batch_size, seed=24680, image_size=image_size)
+    if args.dataset == "flickr30k":
+        from real_captioning_data import FlickrCaptioningDataset
+        ds = FlickrCaptioningDataset(karpathy_split_filter=args.flickr_karpathy_split,
+                                      image_size=image_size, seed=24680)
+    else:
+        ds = SyntheticCaptioningDataset(length=args.batch_size, seed=24680, image_size=image_size)
     dl = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate_images_captions)
     images, captions = next(iter(dl))
     images = images.to(device)
+    B = images.shape[0]
+    print(f"[data] --dataset {args.dataset}, {B} examples "
+          f"{'(SYNTHETIC -- pass --dataset flickr30k to test on real data instead)' if args.dataset == 'synthetic' else ''}")
+
+    # All K captions per example (K=5 for flickr30k, K=1 for synthetic), in the SAME
+    # order as the batch DataLoader just yielded (shuffle=False, so indices 0..B-1
+    # correspond exactly to what get_all_captions(i) below returns).
+    all_captions_per_example = [ds.get_all_captions(i) for i in range(B)]
+    K = len(all_captions_per_example[0])
+    assert all(len(c) == K for c in all_captions_per_example), \
+        "expected the same caption count K for every example in the batch"
 
     with torch.no_grad():
-        B = images.shape[0]
         c = model.task_token.expand(B, -1)
         z_v_tilde = model.encode_visual(images, c)
         Z0 = draw_stochastic_source(z_v_tilde, model.sigma)  # SAME Z0 used for both comparisons below
 
-        batch = model.tokenizer(captions, return_tensors="pt", padding=True)
-        batch = {k: v.to(device) for k, v in batch.items()}
-        enc_out = model.text_seq2seq.get_encoder()(**batch).last_hidden_state
-        Z1_true = F.normalize(model.g_t_online(_mean_pool_text(enc_out, batch["attention_mask"])), dim=-1)
+        Z1_true = encode_captions(model, captions, device)  # (B, D) -- the ONE paired caption, as before
+
+        flat_candidates = [cap for caps in all_captions_per_example for cap in caps]  # B*K strings
+        Z1_candidates = encode_captions(model, flat_candidates, device).view(B, K, -1)  # (B, K, D)
 
     capture_taus = [0.0, 0.5, 0.9, 0.99, 0.999, 1 - 2e-3]
     print(f"\n[integrate] running {args.n_steps}-step trajectory from the SAME Z0 used "
@@ -157,7 +231,7 @@ def main():
     captured = integrate_from_z0_capturing(model, Z0, z_v_tilde, c, capture_taus, args.n_steps)
 
     print(f"\n{'tau':>10}  {'||Z_train||':>12}  {'||Z_infer||':>12}  {'dist(train,infer)':>18}  "
-          f"{'resid_train':>12}  {'resid_infer':>12}  {'resid ratio':>12}")
+          f"{'resid_train':>12}  {'resid_infer':>12}  {'best_of_'+str(K):>10}  {'resid ratio':>12}")
     for target_tau in capture_taus + ["final"]:
         if target_tau not in captured:
             print(f"{str(target_tau):>10}  (not captured -- step resolution too coarse)")
@@ -172,24 +246,32 @@ def main():
             norm_infer = Z_infer.norm(dim=-1).mean().item()
             dist_train_infer = (Z_train - Z_infer).norm(dim=-1).mean().item()
 
-            resid_train = compute_residual(model, Z_train, tau_batch, z_v_tilde, c, Z1_true, Z0)
-            resid_infer = compute_residual(model, Z_infer, tau_batch, z_v_tilde, c, Z1_true, Z0)
+            estimate_train = recover_target_estimate(model, Z_train, tau_batch, z_v_tilde, c)
+            estimate_infer = recover_target_estimate(model, Z_infer, tau_batch, z_v_tilde, c)
+            resid_train = residual_to_target(estimate_train, Z1_true, Z0, model.predictor.edm_precondition)
+            resid_infer = residual_to_target(estimate_infer, Z1_true, Z0, model.predictor.edm_precondition)
+            best_of_k, _ = residual_to_best_of_k(estimate_infer, Z1_candidates, Z0, model.predictor.edm_precondition)
             ratio = resid_infer / resid_train if resid_train > 1e-8 else float("inf")
 
         print(f"{tau_val:>10.4f}  {norm_train:>12.4f}  {norm_infer:>12.4f}  {dist_train_infer:>18.4f}  "
-              f"{resid_train:>12.4f}  {resid_infer:>12.4f}  {ratio:>12.4f}")
+              f"{resid_train:>12.4f}  {resid_infer:>12.4f}  {best_of_k:>10.4f}  {ratio:>12.4f}")
 
     print()
     print("INTERPRETATION GUIDE:")
     print("  ||Z_train|| vs ||Z_infer|| diverging substantially by tau~0.5 -> the real ")
     print("  trajectory leaves the training distribution's support early, not just near tau=1.")
-    print("  resid_train/resid_infer now measured in the BOUNDED target-estimate space")
+    print("  resid_train/resid_infer measured in the BOUNDED target-estimate space")
     print("  (z1_hat vs Z1_true, not raw velocity) for edm_precondition=True checkpoints --")
     print("  should stay roughly bounded (<=~4) at every tau for a well-trained network.")
     print("  resid ratio >> 1 at the same tau -> the predictor's error is genuinely larger")
     print("  off-distribution (at the point integration actually visits) than on-distribution")
     print("  (at the point training actually trained on) for the SAME true target --")
     print("  direct confirmation the network is extrapolating poorly outside what it saw.")
+    print(f"  best_of_{K}: resid_infer scored against whichever of the {K} true captions per")
+    print("  image is closest, not only the one paired in training. best_of_k << resid_infer")
+    print("  means the flow is landing near a DIFFERENT valid caption for the same image, not")
+    print("  failing outright -- real ambiguity only --dataset flickr30k can show (K=1 for")
+    print("  synthetic, where best_of_k == resid_infer exactly, by construction).")
 
 
 if __name__ == "__main__":

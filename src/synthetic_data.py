@@ -97,6 +97,15 @@ class SyntheticCaptioningDataset(Dataset):
         caption = make_caption(color, shape, size_name, position)
         return img, caption
 
+    def get_all_captions(self, idx: int):
+        """Mirrors FlickrCaptioningDataset.get_all_captions's interface so callers
+        (e.g. measure_exposure_bias.py's multi-caption residual check) can treat both
+        datasets uniformly. This dataset's mapping is exact one-to-one (see module
+        docstring) -- always a single-element list, unlike Flickr30k's 5 human
+        captions per image."""
+        color, shape, size_name, position = self._factors[idx]
+        return [make_caption(color, shape, size_name, position)]
+
 
 def collate_images_captions(batch):
     images = torch.stack([b[0] for b in batch], dim=0)

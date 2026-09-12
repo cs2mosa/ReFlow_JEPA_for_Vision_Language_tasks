@@ -124,3 +124,13 @@ class FlickrCaptioningDataset(Dataset):
         caption = self.rng.choice(item[self._caption_field])
         return image_tensor, caption
 
+    def get_all_captions(self, idx):
+        """All 5 original human captions for this image, unlike __getitem__'s single
+        randomly-sampled one -- for callers that need to score against every valid
+        caption rather than one arbitrary pairing (e.g. measure_exposure_bias.py's
+        multi-caption residual check: is a high residual against the ONE paired
+        caption genuine failure, or did the flow land near a DIFFERENT valid caption
+        for the same image -- real multimodal ambiguity this dataset has and
+        SyntheticCaptioningDataset's exact one-to-one mapping cannot exercise)."""
+        return list(self.ds[idx][self._caption_field])
+
