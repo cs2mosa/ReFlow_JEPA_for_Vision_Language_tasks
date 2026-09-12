@@ -34,9 +34,35 @@ from encoders import (
 from qpool import QPool
 from text_projection import TextProjectionHead
 from stochastic_source import draw_stochastic_source
-from predictor import VelocityPredictor
+from predictor import VelocityPredictor, EDM_TAU_CLAMP_MIN
 from prefix_expand import PrefixExpand
 from vicreg import vicreg_variance_penalty
+from alignment_heads import alignment_loss
+
+
+def recover_z1_hat_from_velocity(v_pred: torch.Tensor, tau: torch.Tensor, Z_tau: torch.Tensor) -> torch.Tensor:
+    """Algebraically inverts predictor.py's EDM velocity formula (v_pred = (z1_hat -
+    Z_tau) / (1-tau).clamp(min=EDM_TAU_CLAMP_MIN)) to recover the network's bounded
+    target-estimate z1_hat from its returned velocity. Canonical source for this
+    recovery -- every caller (training_step, gradient_norm_breakdown,
+    measure_exposure_bias.py, reflow_round.py) should use THIS function rather than
+    reimplementing the algebra inline.
+
+    BUG FIXED here: every one of those call sites previously recomputed this using the
+    RAW (1 - tau), not the clamped version predictor.py's forward pass actually used
+    internally. These agree everywhere EXCEPT tau > 1 - EDM_TAU_CLAMP_MIN (i.e.
+    tau > 0.9999) -- a real but rare event under tau ~ Uniform[0,1) (~0.01% of samples,
+    ~10-15 occurrences over a full 4000-step/batch-32 run). When it occurs, the
+    "recovered" z1_hat silently does NOT match what the network's v_pred actually
+    encoded, introducing a small, incorrect training/diagnostic signal precisely in
+    the tau~1 regime this project has already been burned by twice (the raw-velocity
+    500,000-loss spike, and the original motivation for EDM preconditioning at all).
+    The fix is this single shared clamp, not a workaround at each call site --
+    exactly the "never trust an unstabilized division near a boundary" + "canonical
+    source, don't reimplement" standards this project has applied elsewhere
+    (vicreg_variance_penalty, sinkhorn_log_domain)."""
+    denom = (1 - tau).clamp(min=EDM_TAU_CLAMP_MIN).unsqueeze(-1)
+    return Z_tau + v_pred * denom
 
 
 def _extract_patch_tokens(vit_last_hidden_state: torch.Tensor, p_patches: int) -> torch.Tensor:
@@ -80,6 +106,8 @@ class ReflowJEPA(nn.Module):
         edm_precondition: bool = True,
         ema_cfm_target: bool = False,
         visual_encoder: str = "ijepa",
+        freeze_g_t_online: bool = False,
+        freeze_qpool: bool = False,
     ):
         super().__init__()
         self.sigma = sigma
@@ -88,6 +116,8 @@ class ReflowJEPA(nn.Module):
         self.stop_grad_cfm_target = stop_grad_cfm_target
         self.ema_cfm_target = ema_cfm_target
         self.visual_encoder_name = visual_encoder
+        self.freeze_g_t_online = freeze_g_t_online
+        self.freeze_qpool = freeze_qpool
 
         # d_v/p_patches derive from visual_encoder unless explicitly overridden --
         # keeps the two from ever silently disagreeing (VISUAL_ENCODER_SPECS is the
@@ -112,6 +142,20 @@ class ReflowJEPA(nn.Module):
 
         # Trainable Q-Pool (fuses Q-Pool + g_V per the original test suite's implementation)
         self.qpool = QPool(d_v=d_v, d_text=d_text, d_shared=d_shared, k=k_query)
+        if freeze_qpool:
+            # For the Phase-A-FIRST pipeline (see train_phase_a_first.py / Option B in
+            # conversation notes): Q-Pool is trained to alignment-convergence via
+            # alignment_training_step BEFORE this class is ever used for CFM training,
+            # then frozen here so the predictor sees a genuinely stationary z_v_tilde --
+            # satisfying Theorems 2-4's fixed-joint-law premise exactly, not just
+            # approximately (c.f. --stop-grad-cfm-target / --ema-cfm-target, which only
+            # ever mitigated the text side and only ever approximately). Default False:
+            # every existing checkpoint/script keeps training Q-Pool jointly with CFM,
+            # unaffected. NOTE: task_token is ALSO frozen when this is True -- see its
+            # own definition below for why freezing qpool's parameters alone is
+            # insufficient for genuine stationarity.
+            for p in self.qpool.parameters():
+                p.requires_grad_(False)
 
         # Text seq2seq: online encoder+decoder, same-modality EMA target for the text
         # projection. The ENCODER itself is frozen by default (freeze_text_encoder=True)
@@ -132,6 +176,17 @@ class ReflowJEPA(nn.Module):
         # a full freeze would actively break learning rather than fix collapse.
         self.text_seq2seq, self.tokenizer = load_text_seq2seq(num_layers=text_layers, real_checkpoint=real_checkpoints)
         self.g_t_online = TextProjectionHead(d_text=d_text, d_shared=d_shared)
+        if freeze_g_t_online:
+            # Diagnostic-only option (default False, so all existing behavior/
+            # checkpoints are unaffected): makes cfm_loss's target genuinely
+            # stationary, matching Theorems 2-4's standing assumption of a FIXED
+            # joint law of (z_v, z_t, c) exactly, rather than approximately via
+            # stop_grad_cfm_target alone (which stops cfm_loss's OWN gradient from
+            # moving g_t_online, but recon_loss/vicreg_t still do every step). This
+            # is an upper-bound test, not a proposed permanent setting -- you
+            # obviously want g_T to keep improving eventually.
+            for p in self.g_t_online.parameters():
+                p.requires_grad_(False)
 
         if freeze_text_encoder:
             for p in self.text_seq2seq.get_encoder().parameters():
@@ -158,6 +213,22 @@ class ReflowJEPA(nn.Module):
 
         # Single learned task-token, general-VL captioning phase (no per-example question)
         self.task_token = nn.Parameter(torch.randn(1, d_text) * 0.02)
+        if freeze_qpool:
+            # BUG CAUGHT BY TESTING (not just reasoning about it): task_token feeds
+            # into Q-Pool's FiLM conditioning (c, computed from task_token, is what
+            # Q-Pool's forward() modulates its query slots by) -- so freezing qpool's
+            # OWN parameters alone does NOT make z_v_tilde stationary, since
+            # task_token is a separate top-level nn.Parameter, still in core_params
+            # (parameter_groups), still updated by cfm_loss/recon_loss every step.
+            # Verified directly: with only qpool frozen, z_v_tilde still changed
+            # after a single optimizer step even though qpool.query_slots.grad was
+            # None. task_token must freeze alongside qpool for the stationarity
+            # guarantee train_phase_a_first.py's whole design depends on to actually
+            # hold. (task_token also conditions the predictor directly, not just
+            # Q-Pool -- freezing it after Phase-A-first convergence is appropriate
+            # there too: it represents "which task" the model performs, which the
+            # single-task captioning setup fixes for good once alignment converges.)
+            self.task_token.requires_grad_(False)
 
     def _tokenize(self, captions):
         """Single place tokenizer output gets moved to the model's device. Fixes a
@@ -274,6 +345,50 @@ class ReflowJEPA(nn.Module):
         # if frozen, text_encoder_target IS the online encoder (same object) -- nothing to update
         ema_update(self.g_t_target, self.g_t_online, self.ema_momentum)
 
+    def alignment_training_step(
+        self, images: torch.Tensor, captions,
+        sinkhorn_epsilon: float = 0.05, sinkhorn_iters: int = 50, vicreg_gamma: float = 0.02,
+    ):
+        """Phase A-FIRST (train_phase_a_first.py; Option B from conversation notes on
+        making the CFM target genuinely stationary): trains Q-Pool and g_t_online
+        DIRECTLY against the supervised Sinkhorn+VICReg cross-modal objective, with NO
+        predictor or decoder involved at all -- run this BEFORE any CFM training, then
+        freeze both (ReflowJEPA(freeze_qpool=True, freeze_g_t_online=True)) so the
+        predictor trains against a target that satisfies Theorems 2-4's fixed-joint-
+        law premise EXACTLY, not just approximately the way --stop-grad-cfm-target /
+        --ema-cfm-target could.
+
+        Deliberately reuses alignment_heads.alignment_loss directly on z_v_tilde/
+        z_t_tilde -- NOT a separate h_v/h_t head the way the ORIGINAL train_alignment.py
+        Phase A does. That indirection existed there for a real reason (Phase A was
+        bolted on AFTER Phase 1 already existed; modifying Q-Pool/g_t_online directly
+        at that point would have destroyed an already-CFM-trained representation).
+        Here, run FIRST, there is nothing yet to protect -- Q-Pool/g_t_online
+        themselves are what should end up aligned, since THEY are what the flow gets
+        built on top of afterward, not a further-removed projection of them.
+
+        train_alignment.py's original (downstream) Phase A remains fully valid and
+        unchanged for anyone still investigating the OLD ordering -- this is an
+        additional, alternative pipeline stage, not a replacement.
+
+        Returns (align_loss, vicreg_v, vicreg_t, diagnostics) -- deliberately mirrors
+        training_step's (cfm_loss, recon_loss, vicreg_v, vicreg_t, diagnostics)
+        convention (individual, unweighted components; the CALLER applies loss
+        weights and sums), not a pre-summed dict, for consistency with the rest of
+        this class's training-step methods.
+        """
+        B = images.shape[0]
+        c = self.task_token.expand(B, -1)
+        z_v_tilde = self.encode_visual(images, c)
+        z_t_tilde = self.encode_text_online(captions)
+
+        align_loss = alignment_loss(z_v_tilde, z_t_tilde, sinkhorn_epsilon, sinkhorn_iters)
+        vicreg_v = vicreg_variance_penalty(z_v_tilde, vicreg_gamma)
+        vicreg_t = vicreg_variance_penalty(z_t_tilde, vicreg_gamma)
+
+        diagnostics = {"z_v_tilde": z_v_tilde.detach(), "z_t_tilde": z_t_tilde.detach()}
+        return align_loss, vicreg_v, vicreg_t, diagnostics
+
     def training_step(self, images: torch.Tensor, captions, vicreg_gamma: float = 0.02):
         """Phase 1 base CFM (DESIGN.md §2.4, Algorithm 1 line 4), PLUS a decoder
         reconstruction loss that DESIGN.md's original (VQA/candidate-bank) design never
@@ -377,7 +492,7 @@ class ReflowJEPA(nn.Module):
             # inversion: v_pred = (z1_hat - Z_tau)/(1-tau) => z1_hat = v_pred*(1-tau) +
             # Z_tau) and supervise THAT directly -- same information content, but
             # without ever constructing the amplified quantity during training.
-            z1_hat = v_pred * (1 - tau).unsqueeze(-1) + Z_tau
+            z1_hat = recover_z1_hat_from_velocity(v_pred, tau, Z_tau)
             cfm_loss = (z1_hat - Z1_for_cfm).pow(2).sum(dim=-1).mean()
         else:
             cfm_loss = (v_pred - (Z1_for_cfm - Z0)).pow(2).sum(dim=-1).mean()
@@ -407,6 +522,29 @@ class ReflowJEPA(nn.Module):
             "z_t_norm": Z1.norm(dim=-1).mean().item(),
         }
         return cfm_loss, recon_loss, vicreg_v, vicreg_t, diagnostics
+
+    def decoder_recon_loss(self, Z1: torch.Tensor, captions) -> torch.Tensor:
+        """Computes JUST the decoder reconstruction loss for an ARBITRARY Z1 (any
+        (B, d_shared) tensor) against the given captions -- factored out of
+        training_step so Phase D (train_decoder_correction.py) can supervise the
+        decoder against a REAL integrate() rollout's z_hat, not the exact z_t_tilde
+        target it was originally trained against (see conversation notes: freezing
+        Q-Pool/g_t_online for a stationary CFM target removes the old pipeline's
+        accidental exposure-bias mitigation -- a constantly-drifting g_t_online used
+        to give the decoder incidental exposure to a neighborhood around each
+        caption, not just its exact point; Phase D restores that exposure
+        deliberately, against the ACTUAL rollout distribution, the same idea as
+        DAgger/Scheduled Sampling one level up from token-level).
+
+        training_step itself is left untouched, inline, exactly as before -- this
+        does not replace anything there, it's purely additive for the new use case,
+        where Z1 is not necessarily anything this class computed itself.
+        """
+        batch = self._tokenize(captions)
+        recon_prefix = self.prefix_expand(Z1)
+        labels = batch["input_ids"].clone()
+        labels[batch["attention_mask"] == 0] = -100
+        return self.text_seq2seq(encoder_outputs=(recon_prefix,), labels=labels).loss
 
     def gradient_norm_breakdown(self, images: torch.Tensor, captions, vicreg_gamma: float = 0.02):
         """Diagnostic only (not part of the training step): for each loss term, the
@@ -439,7 +577,7 @@ class ReflowJEPA(nn.Module):
         Z_tau = (1 - tau).unsqueeze(-1) * Z0 + tau.unsqueeze(-1) * Z1_for_cfm
         v_pred = self.predictor(Z_tau, tau, z_v_tilde, c)
         if self.predictor.edm_precondition:
-            z1_hat = v_pred * (1 - tau).unsqueeze(-1) + Z_tau
+            z1_hat = recover_z1_hat_from_velocity(v_pred, tau, Z_tau)
             cfm_loss = (z1_hat - Z1_for_cfm).pow(2).sum(dim=-1).mean()
         else:
             cfm_loss = (v_pred - (Z1_for_cfm - Z0)).pow(2).sum(dim=-1).mean()
@@ -456,6 +594,18 @@ class ReflowJEPA(nn.Module):
             ("vicreg_t_on_text", vicreg_t, text_anchor),
             ("cfm_on_visual", cfm_loss, visual_anchor), ("vicreg_v_on_visual", vicreg_v, visual_anchor),
         ]:
+            if not anchor.requires_grad:
+                # BUG FIXED here: torch.autograd.grad requires the ANCHOR itself to
+                # require grad, even with allow_unused=True (that flag only covers
+                # "the graph doesn't connect loss to anchor," a different failure
+                # mode) -- crashed outright once freeze_qpool/freeze_g_t_online made
+                # these anchors frozen (caught by actually running train.py's real
+                # eval loop end-to-end, not by testing this method in isolation). A
+                # frozen anchor has zero possible gradient contribution by
+                # construction, so 0.0 is the correct diagnostic answer, not an
+                # error-avoidance workaround.
+                norms[name] = 0.0
+                continue
             grad = torch.autograd.grad(loss, anchor, retain_graph=True, allow_unused=True)[0]
             norms[name] = 0.0 if grad is None else grad.norm().item()
         return norms

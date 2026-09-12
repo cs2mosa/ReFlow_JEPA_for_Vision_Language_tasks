@@ -97,6 +97,38 @@ def parse_args():
                          "run showed cfm_loss's gradient on the text projection (~77) "
                          "completely swamping VICReg's counter-pressure (~0.07), actively "
                          "driving collapse regardless of loss weight.")
+    p.add_argument("--freeze-g-t-online", type=lambda x: x.lower() != "false", default=False,
+                    help="default False (unchanged behavior). True: g_t_online never updates "
+                         "at all. Originally added as a diagnostic upper bound for testing "
+                         "whether cfm_loss's target being non-stationary was contributing to "
+                         "the exposure-bias plateau found in measure_exposure_bias.py -- now "
+                         "ALSO the real mechanism for the Phase-A-FIRST pipeline (see "
+                         "train_phase_a_first.py and --base-checkpoint-path below): pass this "
+                         "as True together with --freeze-qpool true when loading a Phase-A-"
+                         "first checkpoint, so the predictor trains against a genuinely "
+                         "stationary target rather than an approximated one.")
+    p.add_argument("--freeze-qpool", type=lambda x: x.lower() != "false", default=False,
+                    help="default False (unchanged behavior, Q-Pool trains jointly with CFM "
+                         "as before). True: Q-Pool AND task_token never update at all -- see "
+                         "reflow_jepa.py's ReflowJEPA.__init__ for why task_token must freeze "
+                         "alongside Q-Pool for this to actually produce a stationary z_v_tilde "
+                         "(a real gap caught by testing, not just reasoning: task_token feeds "
+                         "Q-Pool's FiLM conditioning, so freezing Q-Pool's own parameters alone "
+                         "was insufficient). Intended to be used together with "
+                         "--freeze-g-t-online true, loading a train_phase_a_first.py checkpoint "
+                         "via --base-checkpoint-path.")
+    p.add_argument("--base-checkpoint-path", type=str, default=None,
+                    help="if set, load this checkpoint's model_state_dict into the freshly-"
+                         "constructed model BEFORE training starts (train.py otherwise always "
+                         "starts from scratch). The primary use: loading a "
+                         "train_phase_a_first.py checkpoint, together with --freeze-qpool true "
+                         "--freeze-g-t-online true, so Phase 1 trains the predictor/decoder on "
+                         "top of an already-converged, now-frozen alignment. Loaded with "
+                         "strict=False -- shapes must still match (architecture flags below "
+                         "must match what the checkpoint was actually built with), but this "
+                         "tolerates the predictor/prefix_expand/decoder keys differing in value "
+                         "(expected: train_phase_a_first.py never trained them, they're "
+                         "whatever random init that script happened to construct).")
     p.add_argument("--k-query", type=int, default=8)
     p.add_argument("--k-prefix", type=int, default=8)
     p.add_argument("--visual-encoder", type=str, default="ijepa", choices=["ijepa", "siglip"],
@@ -123,9 +155,24 @@ def parse_args():
                          "on); the point where genuine multimodal ambiguity (multiple valid "
                          "captions per image) becomes testable, unlike the synthetic set's "
                          "exact mapping.")
-    p.add_argument("--flickr-karpathy-split", type=str, default=None,
-                    help="optional filter on flickr30k's own internal train/val/test 'split' "
-                         "column (Karpathy partition). None (default): use every row.")
+    p.add_argument("--flickr-train-split", type=str, default="train",
+                    help="filter on flickr30k's internal 'split' column (Karpathy partition) "
+                         "for the TRAINING dataset. FIX: previously a single "
+                         "--flickr-karpathy-split (default None = every row) was used for BOTH "
+                         "train and eval, meaning eval was drawn from the same pool the model "
+                         "was actively being trained on -- every retrieval-accuracy/z-score "
+                         "number reported before this fix should be read with that in mind. "
+                         "Pass None explicitly to restore the old (no split) behavior for a "
+                         "specific reason; the actual string values here have NOT been verified "
+                         "against the real download from this sandbox (no internet route to "
+                         "huggingface.co) -- FlickrCaptioningDataset now fails loudly with the "
+                         "real available values if this doesn't match anything, rather than "
+                         "silently doing the wrong thing.")
+    p.add_argument("--flickr-eval-split", type=str, default="val",
+                    help="same filter, for the EVAL dataset -- must differ from "
+                         "--flickr-train-split for eval to be genuinely held-out. See "
+                         "--flickr-train-split's help for why this pair of flags replaced the "
+                         "single --flickr-karpathy-split.")
     p.add_argument("--dataset-length", type=int, default=50000,
                     help="only used when --dataset synthetic; flickr30k's length is fixed by "
                          "the real dataset (~31k images)")
@@ -169,6 +216,15 @@ def parse_args():
     if args.image_size is None:
         from encoders import VISUAL_ENCODER_SPECS
         args.image_size = VISUAL_ENCODER_SPECS[args.visual_encoder][2]
+    # argparse's type=str never converts the literal text "None" to Python None --
+    # handled explicitly here so --flickr-train-split None / --flickr-eval-split None
+    # actually restores the old (no split) behavior, matching what their --help text
+    # says, rather than silently filtering for a literal "None" string that will
+    # never match a real row.
+    if args.flickr_train_split == "None":
+        args.flickr_train_split = None
+    if args.flickr_eval_split == "None":
+        args.flickr_eval_split = None
     return args
 
 
@@ -213,6 +269,8 @@ def build_model(args, device):
         freeze_text_encoder=args.freeze_text_encoder,
         stop_grad_cfm_target=args.stop_grad_cfm_target,
         visual_encoder=args.visual_encoder,
+        freeze_g_t_online=args.freeze_g_t_online,
+        freeze_qpool=args.freeze_qpool,
     ).to(device)
     return model
 
@@ -263,15 +321,49 @@ def main():
     print(f"[train] device={device} real_checkpoints={args.real_checkpoints}")
 
     model = build_model(args, device)
+
+    if args.base_checkpoint_path is not None:
+        print(f"[train] loading base checkpoint from {args.base_checkpoint_path!r} "
+              f"before training starts")
+        base_ckpt = torch.load(args.base_checkpoint_path, map_location=device)
+        state_dict = base_ckpt["model_state_dict"] if isinstance(base_ckpt, dict) and "model_state_dict" in base_ckpt else base_ckpt
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            print(f"[train] WARNING: non-strict load -- missing={missing}, "
+                  f"unexpected={unexpected}. If these are predictor/prefix_expand/"
+                  f"decoder keys and this checkpoint came from train_phase_a_first.py, "
+                  f"that's expected (see --base-checkpoint-path --help). Any qpool/"
+                  f"g_t_online/task_token/encoder key appearing here is NOT expected "
+                  f"and means the architecture flags below don't match what this "
+                  f"checkpoint was actually built with.")
+        if args.freeze_qpool and args.freeze_g_t_online:
+            explicit_vicreg = (args.vicreg_v_weight is not None and args.vicreg_v_weight > 0) or \
+                               (args.vicreg_t_weight is not None and args.vicreg_t_weight > 0) or \
+                               args.vicreg_weight > 0
+            if explicit_vicreg:
+                print("[train] NOTE: --freeze-qpool true --freeze-g-t-online true means "
+                      "z_v_tilde/z_t_tilde cannot change at all (verified directly, not "
+                      "just argued -- see reflow_jepa.py tests). A target that literally "
+                      "cannot move also cannot collapse, so VICReg's anti-collapse "
+                      "pressure on it is now mathematically inert: it still computes a "
+                      "loss value, but contributes exactly zero gradient anywhere, on "
+                      "every step, for the rest of this run. Not overriding your "
+                      "explicit --vicreg-*-weight values, but they're pure wasted "
+                      "compute in this configuration -- consider passing "
+                      "--vicreg-v-weight 0 --vicreg-t-weight 0 for a cleaner, "
+                      "slightly faster run.")
+
     n_trainable = sum(p.numel() for p in model.trainable_parameters())
     print(f"[train] trainable params: {n_trainable / 1e6:.1f}M")
 
     if args.dataset == "flickr30k":
         print("[train] loading nlphuji/flickr30k (requires internet access -- if this "
               "hangs or fails, confirm Kaggle's Internet toggle is on)")
-        dataset = FlickrCaptioningDataset(karpathy_split_filter=args.flickr_karpathy_split,
+        print(f"[train] flickr30k train split filter={args.flickr_train_split!r}, "
+              f"eval split filter={args.flickr_eval_split!r}")
+        dataset = FlickrCaptioningDataset(karpathy_split_filter=args.flickr_train_split,
                                            image_size=args.image_size, seed=args.seed)
-        eval_dataset = FlickrCaptioningDataset(karpathy_split_filter=args.flickr_karpathy_split,
+        eval_dataset = FlickrCaptioningDataset(karpathy_split_filter=args.flickr_eval_split,
                                                 image_size=args.image_size, seed=999)
     else:
         dataset = SyntheticCaptioningDataset(length=args.dataset_length, image_size=args.image_size)
