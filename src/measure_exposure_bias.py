@@ -157,6 +157,12 @@ def main():
                          "see train.py --help for what this changes")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--n-steps", type=int, default=500)
+    p.add_argument("--sigma", type=float, default=0.02,
+                    help="must match whatever the loaded checkpoint was actually trained with -- "
+                         "sigma is a plain attribute, not a saved buffer, so load_state_dict "
+                         "cannot restore it from the checkpoint; passing the wrong value here "
+                         "silently draws Z0 from a differently-sized noise ball than the "
+                         "checkpoint was trained on, invalidating this whole comparison")
     p.add_argument("--visual-encoder", type=str, default="ijepa", choices=["ijepa", "siglip"],
                     help="must match whatever the loaded checkpoint was trained with")
     p.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "flickr30k"],
@@ -180,6 +186,7 @@ def main():
         edm_precondition=args.edm_precondition,
         ema_cfm_target=args.ema_cfm_target,
         visual_encoder=args.visual_encoder,
+        sigma=args.sigma,
     ).to(device)
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
@@ -214,6 +221,13 @@ def main():
     K = len(all_captions_per_example[0])
     assert all(len(c) == K for c in all_captions_per_example), \
         "expected the same caption count K for every example in the batch"
+
+    from encoders import D_SHARED
+    predicted_z0_norm = (1 + (args.sigma ** 2) * D_SHARED) ** 0.5
+    print(f"[sigma] using sigma={args.sigma} -> predicted ||Z0||={predicted_z0_norm:.4f} if this "
+          f"matches the checkpoint's actual training sigma. Compare against ||Z_train|| at "
+          f"tau=0.0 in the table below -- a mismatch there means --sigma doesn't match what "
+          f"this checkpoint was actually trained with, and everything below is invalid.")
 
     with torch.no_grad():
         c = model.task_token.expand(B, -1)
